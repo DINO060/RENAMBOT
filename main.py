@@ -19,7 +19,11 @@ from telethon.tl.types import SendMessageTypingAction, SendMessageUploadDocument
 import logging
 
 # Import de la configuration
-from config import API_ID, API_HASH, TOKEN, ADMIN_IDS
+
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+TOKEN = os.getenv("TOKEN")
+ADMIN_IDS = os.getenv("ADMIN_IDS")
 
 # Configuration
 MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB
