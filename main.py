@@ -26,7 +26,7 @@ TOKEN = os.getenv("TOKEN")
 ADMIN_IDS = os.getenv("ADMIN_IDS")
 
 # 🔥 CONFIGURATION FORCE JOIN CHANNEL 🔥
-FORCE_JOIN_CHANNEL = "toncanalofficiel"  # ⚠️ REMPLACE PAR TON CANAL (sans @)
+FORCE_JOIN_CHANNEL = "@djd208"  # ⚠️ REMPLACE PAR TON CANAL (sans @)
 
 # Configuration
 MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB
