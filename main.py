@@ -13,17 +13,20 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, UserNotParticipantError, ChannelPrivateError
 from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import SendMessageTypingAction, SendMessageUploadDocumentAction
+from telethon.tl.functions.channels import GetParticipantRequest
 import logging
 
 # Import de la configuration
-
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 TOKEN = os.getenv("TOKEN")
 ADMIN_IDS = os.getenv("ADMIN_IDS")
+
+# 🔥 CONFIGURATION FORCE JOIN CHANNEL 🔥
+FORCE_JOIN_CHANNEL = "toncanalofficiel"  # ⚠️ REMPLACE PAR TON CANAL (sans @)
 
 # Configuration
 MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB
@@ -55,6 +58,48 @@ usage_file = "user_usage.json"
 sessions = {}  # Pour stocker les préférences utilisateur
 
 DEFAULT_USERNAME = "@dino_renamebot"  # Mets ici ton vrai username
+
+# 🔥 FONCTIONS FORCE JOIN CHANNEL 🔥
+async def is_user_in_channel(user_id):
+    """Vérifie si l'utilisateur est membre du canal"""
+    # Exemption pour les admins
+    admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()] if ADMIN_IDS else []
+    if user_id in admin_list:
+        return True
+    
+    try:
+        await bot(GetParticipantRequest(
+            channel=FORCE_JOIN_CHANNEL,
+            participant=user_id
+        ))
+        return True
+    except UserNotParticipantError:
+        return False
+    except ChannelPrivateError:
+        logging.error(f"Bot n'a pas accès au canal {FORCE_JOIN_CHANNEL}")
+        return True  # On laisse passer pour éviter de bloquer
+    except Exception as e:
+        logging.error(f"Erreur vérification canal: {e}")
+        return True  # En cas d'erreur, on laisse passer
+
+async def send_force_join_message(event):
+    """Envoie le message demandant de rejoindre le canal"""
+    buttons = [
+        [Button.url(f"📢 Join @{FORCE_JOIN_CHANNEL}", f"https://t.me/{FORCE_JOIN_CHANNEL}")],
+        [Button.inline("✅ I have joined", "check_joined")]
+    ]
+    
+    message = f"""🚫 <b>Access Denied!</b>
+
+To use this bot, you must first join our official channel:
+👉 @{FORCE_JOIN_CHANNEL}
+
+✅ Click the button below to join.
+Once done, click "I have joined" to continue.
+
+<i>Thank you for your support! 💙</i>"""
+    
+    await event.reply(message, parse_mode='html', buttons=buttons)
 
 def clean_filename_text(text):
     """Nettoie le texte en supprimant tous les @username et hashtags"""
@@ -91,7 +136,7 @@ def add_custom_text_to_filename(filename, custom_text=None, position='end'):
 
 def add_default_username_to_filename(filename, username, position='end'):
     name, ext = os.path.splitext(filename)
-    # Évite de l’ajouter plusieurs fois
+    # Évite de l'ajouter plusieurs fois
     if username.lower() in name.lower():
         return filename
     if position == 'end':
@@ -182,7 +227,7 @@ def check_user_limits(user_id, file_size):
     current_daily = user_usage[user_id]['daily_bytes']
     if current_daily + file_size > DAILY_LIMIT_BYTES:
         remaining = DAILY_LIMIT_BYTES - current_daily
-        return False, f"Limite quotidienne atteinte! Utilisé: {human_readable_size(current_daily)}/{human_readable_size(DAILY_LIMIT_BYTES)}. Restant: {human_readable_size(remaining)}"
+        return False, f"Daily limit reached! Used: {human_readable_size(current_daily)}/{human_readable_size(DAILY_LIMIT_BYTES)}. Remaining: {human_readable_size(remaining)}"
     
     # Vérifier le délai entre les fichiers
     last_file_time = user_usage[user_id].get('last_file_time')
@@ -191,7 +236,7 @@ def check_user_limits(user_id, file_size):
         time_since_last = (datetime.now() - last_file_time).total_seconds()
         if time_since_last < COOLDOWN_SECONDS:
             remaining_cooldown = COOLDOWN_SECONDS - time_since_last
-            return False, f"Attendez {int(remaining_cooldown)} secondes avant le prochain fichier"
+            return False, f"Please wait {int(remaining_cooldown)} seconds before the next file"
     
     return True, "OK"
 
@@ -411,10 +456,28 @@ async def clean_old_sessions():
                 pass
         del user_sessions[user_id]
 
+# 🔥 HANDLER POUR LE BOUTON "J'ai rejoint" 🔥
+@bot.on(events.CallbackQuery(data="check_joined"))
+async def check_joined_handler(event):
+    user_id = event.query.user_id
+    
+    if await is_user_in_channel(user_id):
+        await event.answer("✅ Thank you! You can now use the bot.", alert=True)
+        await event.delete()
+        # Afficher le message de bienvenue
+        await bot.send_message(user_id, "/start")
+    else:
+        await event.answer("❌ You haven't joined the channel yet!", alert=True)
+
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     """Handler amélioré pour la commande /start"""
     user_id = event.sender_id
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(event)
+        return
     
     # Charger les données si pas déjà fait
     if not hasattr(start_handler, 'data_loaded'):
@@ -447,7 +510,7 @@ Send me any file and I'll help you rename it.
 <b>📊 Your Daily Usage:</b>
 • Used: {human_readable_size(usage_info['daily_used'])} / {human_readable_size(usage_info['daily_limit'])} ({usage_info['percentage']:.1f}%)
 • Remaining: {human_readable_size(usage_info['daily_remaining'])}
-• Cooldown: 30 seconds between files
+• Cooldown: {COOLDOWN_SECONDS} seconds between files
 
 <b>🎯 Commands:</b>
 /start - Show this message
@@ -524,6 +587,12 @@ async def status_handler(event):
 async def usage_handler(event):
     """Handler pour vérifier l'utilisation de l'utilisateur"""
     user_id = event.sender_id
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(event)
+        return
+    
     usage_info = get_user_usage_info(user_id)
     
     # Créer une barre de progression
@@ -556,6 +625,13 @@ async def usage_handler(event):
 @bot.on(events.NewMessage(pattern='/settings'))
 async def settings_command(event):
     """Handler pour la commande /settings"""
+    user_id = event.sender_id
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(event)
+        return
+    
     await show_settings_menu(event)
 
 async def show_settings_menu(event):
@@ -623,6 +699,11 @@ async def setthumb_handler(event):
     """Handler pour définir une miniature"""
     user_id = event.sender_id
     
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(event)
+        return
+    
     # Stocker que l'utilisateur veut définir un thumbnail
     user_sessions[user_id] = {
         'action': 'set_thumbnail',
@@ -643,6 +724,12 @@ async def setthumb_handler(event):
 async def delthumb_handler(event):
     """Handler pour supprimer la miniature"""
     user_id = event.sender_id
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(event)
+        return
+    
     thumb_path = os.path.join(THUMBNAIL_DIR, "{}.jpg".format(user_id))
     
     if os.path.exists(thumb_path):
@@ -658,6 +745,12 @@ async def delthumb_handler(event):
 async def showthumb_handler(event):
     """Handler pour afficher la miniature actuelle"""
     user_id = event.sender_id
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(event)
+        return
+    
     thumb_path = os.path.join(THUMBNAIL_DIR, "{}.jpg".format(user_id))
     
     if os.path.exists(thumb_path):
@@ -723,6 +816,11 @@ async def photo_handler(event):
 async def file_handler(event):
     """Handler principal pour les fichiers (pas les photos)"""
     user_id = event.sender_id
+    
+    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    if not await is_user_in_channel(user_id):
+        await send_force_join_message(event)
+        return
     
     # Nettoyer les anciennes sessions
     await clean_old_sessions()
@@ -920,7 +1018,7 @@ Send /cancel to abort."""
         message = "👤 <b>Add/Edit Username</b>\n\n"
         if current_username:
             message += f"Current: <code>{current_username}</code>\n\n"
-        message += "Send me the username to add to all filenames (e.g. <code>@monchannel</code>).\n\nSend /cancel to abort."
+        message += "Send me the username to add to all filenames (e.g. <code>@mychannel</code>).\n\nSend /cancel to abort."
         await event.edit(message, parse_mode='html')
         return
     
@@ -1079,14 +1177,18 @@ Send /cancel to abort."""
                     # Pour les documents, utiliser le thumbnail comme preview
                     thumb_to_use = thumb_path
                 
+                # Créer la caption avec le nom du fichier
+                caption = f"<code>{sanitized_name}</code>"
+                
                 await bot.send_file(
                     event.chat_id,
                     temp_path,
-                    caption="",
+                    caption=caption,
                     parse_mode='html',
                     file_name=sanitized_name,
                     thumb=thumb_to_use,  # Thumbnail pour preview (documents)
-                    supports_streaming=is_video,
+                    supports_streaming=False,  # Force l'affichage du nom
+                    force_document=True,       # Force l'envoi en document
                     attributes=file_attributes
                 )
                 
@@ -1340,16 +1442,20 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
         if video_attributes:
             file_attributes.extend(video_attributes)
         
+        # Créer la caption avec le nom du fichier
+        caption = f"<code>{sanitized_name}</code>"
+        
         # Envoyer le fichier avec tous les attributs nécessaires
         await event.client.send_file(
             event.chat_id,
             upload_path,
-            caption="",  # Caption vide
+            caption=caption,  # Caption avec le nom du fichier
+            parse_mode='html',
             file_name=sanitized_name,
             thumb=thumb_to_use,
-            supports_streaming=is_video,  # Active le streaming pour les vidéos
-            attributes=file_attributes,    # Inclut tous les attributs nécessaires
-            force_document=False,          # Permet à Telegram de détecter le type
+            supports_streaming=False,  # Force l'affichage du nom
+            force_document=True,       # Force l'envoi en document
+            attributes=file_attributes,
             progress_callback=upload_progress,
             part_size_kb=512  # Chunks optimisés pour de meilleures performances
         )
@@ -1399,6 +1505,7 @@ def main():
     print("📈 Daily limit: {} per user".format(human_readable_size(DAILY_LIMIT_BYTES)))
     print("⏱ Cooldown: {} seconds between files".format(COOLDOWN_SECONDS))
     print("⚡ Fast thumbnail mode: ENABLED")
+    print(f"📢 Force Join Channel: @{FORCE_JOIN_CHANNEL}")
     
     # Charger les données
     load_user_usage()
@@ -1413,10 +1520,12 @@ def main():
                 try:
                     await bot.send_message(
                         admin_id, 
-                        "🟢 <b>Bot started!</b>\n\nRename bot is now online and ready.\n\n📈 Daily limit: {}\n⏱ Cooldown: {}s\n⚡ Fast mode: ENABLED".format(
-                            human_readable_size(DAILY_LIMIT_BYTES),
-                            COOLDOWN_SECONDS
-                        ),
+                        f"🟢 <b>Bot started!</b>\n\n"
+                        f"Rename bot is now online and ready.\n\n"
+                        f"📈 Daily limit: {human_readable_size(DAILY_LIMIT_BYTES)}\n"
+                        f"⏱ Cooldown: {COOLDOWN_SECONDS}s\n"
+                        f"⚡ Fast mode: ENABLED\n"
+                        f"📢 Force Join: @{FORCE_JOIN_CHANNEL}",
                         parse_mode='html'
                     )
                 except:
