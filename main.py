@@ -19,50 +19,108 @@ from telethon.tl.types import SendMessageTypingAction, SendMessageUploadDocument
 from telethon.tl.functions.channels import GetParticipantRequest
 import logging
 
-# Import de la configuration
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-TOKEN = os.getenv("TOKEN")
-ADMIN_IDS = os.getenv("ADMIN_IDS")
+# Import configuration
+def get_env_or_config(attr, default=None):
+    value = os.environ.get(attr)
+    if value is not None:
+        if attr == "API_ID":
+            return int(value)
+        return value
+    try:
+        from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS
+        return locals()[attr]
+    except Exception:
+        return default
 
-# 🔥 CONFIGURATION FORCE JOIN CHANNEL 🔥
-FORCE_JOIN_CHANNEL = "djd208"  # ⚠️ REMPLACE PAR TON CANAL (sans @)
+API_ID = get_env_or_config("API_ID")
+API_HASH = get_env_or_config("API_HASH")
+BOT_TOKEN = get_env_or_config("BOT_TOKEN")
+ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
+
+
+async def safe_edit(msg_obj, new_text, **kwargs):
+    """
+    Edit Telegram message only if content changed.
+    Prevents 'EditMessageRequest: message not modified' error.
+    """
+    try:
+        # Check if the message exists and has a 'message' attribute
+        current_text = getattr(msg_obj, 'message', None)
+        
+        # If the text is identical, don't edit
+        if current_text == new_text:
+            return msg_obj
+            
+        # Check if the message still exists
+        if not msg_obj or not hasattr(msg_obj, 'edit'):
+            return msg_obj
+            
+        return await msg_obj.edit(new_text, **kwargs)
+    except Exception as e:
+        if "message not modified" in str(e).lower():
+            # Silently ignore this error
+            return msg_obj
+        else:
+            # Re-raise other errors
+            raise
+
+# Import configuration
+#bAPI_ID = int(os.getenv("API_ID"))
+#API_HASH = os.getenv("API_HASH")
+#TOKEN = os.getenv("TOKEN")
+#ADMIN_IDS = os.getenv("ADMIN_IDS")
+
+# 🔥 FORCE JOIN CHANNEL CONFIGURATION 🔥
+FORCE_JOIN_CHANNEL = "djd208"  # ⚠️ REPLACE WITH YOUR CHANNEL (without @)
 
 # Configuration
 MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB
 TEMP_DIR = "temp_files"
 THUMBNAIL_DIR = "thumbnails"
+DOWNLOAD_DIR = "downloads"  # New directory to store files
 USER_TIMEOUT = 600  # 10 minutes
-PROGRESS_UPDATE_INTERVAL = 5  # secondes
+PROGRESS_UPDATE_INTERVAL = 5  # seconds
 MAX_THUMB_SIZE = 200 * 1024  # 200 KB
 
-# Nouvelles limites
-DAILY_LIMIT_GB = 1  # 1 GB par jour par utilisateur
+# New limits
+DAILY_LIMIT_GB = 2  # 2 GB per day per user
 DAILY_LIMIT_BYTES = DAILY_LIMIT_GB * 1024 * 1024 * 1024
-COOLDOWN_SECONDS = 30  # 30 secondes entre les fichiers
+COOLDOWN_SECONDS = 30  # 30 seconds between files
 
-# Configuration du logging
+# Logging configuration
 logging.basicConfig(
     format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s',
     level=logging.INFO
 )
 
-# Dictionnaire pour stocker les sessions utilisateur
+# Create necessary directories
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(THUMBNAIL_DIR, exist_ok=True)
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)  # New directory
+
+# Dictionary to store user sessions
 user_sessions = {}
 
-# Système de limites d'utilisation
+# Usage limits system
 user_usage = defaultdict(lambda: {'daily_bytes': 0, 'last_reset': None, 'last_file_time': None})
 usage_file = "user_usage.json"
 
-# Système de préférences utilisateur
-sessions = {}  # Pour stocker les préférences utilisateur
+# User preferences system
+sessions = {}  # To store user preferences
 
-DEFAULT_USERNAME = "@dino_renamebot"  # Mets ici ton vrai username
+DEFAULT_USERNAME = "@dino_renamebot"  # Put your real username here
 
-# 🔥 FONCTIONS FORCE JOIN CHANNEL 🔥
+# HELPER FUNCTION TO GET LOCAL FILE PATH
+def get_local_file_path(user_id, file_id, extension):
+    """Returns the local path of a file"""
+    user_dir = os.path.join(DOWNLOAD_DIR, str(user_id))
+    os.makedirs(user_dir, exist_ok=True)
+    return os.path.join(user_dir, f"{file_id}{extension}")
+
+# 🔥 FORCE JOIN CHANNEL FUNCTIONS 🔥
 async def is_user_in_channel(user_id):
-    """Vérifie si l'utilisateur est membre du canal"""
-    # Exemption pour les admins
+    """Checks if the user is a member of the channel"""
+    # Admin exemption
     admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()] if ADMIN_IDS else []
     if user_id in admin_list:
         return True
@@ -76,14 +134,14 @@ async def is_user_in_channel(user_id):
     except UserNotParticipantError:
         return False
     except ChannelPrivateError:
-        logging.error(f"Bot n'a pas accès au canal {FORCE_JOIN_CHANNEL}")
-        return True  # On laisse passer pour éviter de bloquer
+        logging.error(f"Bot doesn't have access to channel {FORCE_JOIN_CHANNEL}")
+        return True  # Let it pass to avoid blocking
     except Exception as e:
-        logging.error(f"Erreur vérification canal: {e}")
-        return True  # En cas d'erreur, on laisse passer
+        logging.error(f"Channel verification error: {e}")
+        return True  # In case of error, let it pass
 
 async def send_force_join_message(event):
-    """Envoie le message demandant de rejoindre le canal"""
+    """Sends the message asking the user to join the channel"""
     buttons = [
         [Button.url(f"📢 Join @{FORCE_JOIN_CHANNEL}", f"https://t.me/{FORCE_JOIN_CHANNEL}")],
         [Button.inline("✅ I have joined", "check_joined")]
@@ -102,41 +160,41 @@ Once done, click "I have joined" to continue.
     await event.reply(message, parse_mode='html', buttons=buttons)
 
 def clean_filename_text(text):
-    """Nettoie le texte en supprimant tous les @username et hashtags"""
+    """Cleans the text by removing all @usernames and hashtags"""
     if not text:
         return text
-    # Supprimer tous les formats de @username
+    # Remove all @username formats
     text = re.sub(r'[\[\(\{]?@\w+[\]\)\}]?', '', text, flags=re.IGNORECASE)
-    # Supprimer les hashtags
+    # Remove hashtags
     text = re.sub(r'#\w+', '', text, flags=re.IGNORECASE)
-    # Supprimer les espaces multiples
+    # Remove multiple spaces
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def add_custom_text_to_filename(filename, custom_text=None, position='end'):
-    """Ajoute un texte personnalisé au nom du fichier"""
+    """Adds a custom text to the filename"""
     if not custom_text:
         return filename
     
     name, ext = os.path.splitext(filename)
     
-    # Nettoyer d'abord le nom existant
+    # Clean up the existing name first
     name = clean_filename_text(name)
     
-    # Ajouter le texte personnalisé
+    # Add custom text
     if position == 'end':
         name = f"{name} {custom_text}"
     else:  # start
         name = f"{custom_text} {name}"
     
-    # Nettoyer les espaces multiples
+    # Clean up multiple spaces
     name = re.sub(r'\s+', ' ', name).strip()
     
     return f"{name}{ext}"
 
 def add_default_username_to_filename(filename, username, position='end'):
     name, ext = os.path.splitext(filename)
-    # Évite de l'ajouter plusieurs fois
+    # Avoid adding it multiple times
     if username.lower() in name.lower():
         return filename
     if position == 'end':
@@ -147,7 +205,7 @@ def add_default_username_to_filename(filename, username, position='end'):
     return f"{name}{ext}"
 
 def save_user_preferences():
-    """Sauvegarde les préférences utilisateur"""
+    """Saves user preferences"""
     try:
         prefs = {}
         for user_id, session in sessions.items():
@@ -161,10 +219,10 @@ def save_user_preferences():
         with open('user_preferences.json', 'w') as f:
             json.dump(prefs, f, indent=2)
     except Exception as e:
-        logging.error(f"Erreur sauvegarde préférences: {e}")
+        logging.error(f"Error saving preferences: {e}")
 
 def load_user_preferences():
-    """Charge les préférences utilisateur"""
+    """Loads user preferences"""
     try:
         if os.path.exists('user_preferences.json'):
             with open('user_preferences.json', 'r') as f:
@@ -173,17 +231,13 @@ def load_user_preferences():
                     user_id = int(user_id_str)
                     sessions[user_id] = pref_data
     except Exception as e:
-        logging.error(f"Erreur chargement préférences: {e}")
+        logging.error(f"Error loading preferences: {e}")
 
-# Créer le dossier temporaire
-os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(THUMBNAIL_DIR, exist_ok=True)
-
-# Initialiser le client Telethon
+# Initialize the Telethon client
 bot = TelegramClient('rename_bot', API_ID, API_HASH).start(bot_token=TOKEN)
 
 def load_user_usage():
-    """Charge les données d'utilisation depuis le fichier"""
+    """Loads usage data from the file"""
     try:
         if os.path.exists(usage_file):
             with open(usage_file, 'r') as f:
@@ -192,10 +246,10 @@ def load_user_usage():
                     user_id = int(user_id_str)
                     user_usage[user_id] = usage_data
     except Exception as e:
-        logging.error(f"Erreur chargement usage: {e}")
+        logging.error(f"Error loading usage: {e}")
 
 def save_user_usage():
-    """Sauvegarde les données d'utilisation dans le fichier"""
+    """Saves usage data to the file"""
     try:
         data = {}
         for user_id, usage_data in user_usage.items():
@@ -203,10 +257,10 @@ def save_user_usage():
         with open(usage_file, 'w') as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        logging.error(f"Erreur sauvegarde usage: {e}")
+        logging.error(f"Error saving usage: {e}")
 
 def reset_daily_usage_if_needed(user_id):
-    """Réinitialise l'utilisation quotidienne si nécessaire"""
+    """Resets daily usage if needed"""
     now = datetime.now()
     last_reset = user_usage[user_id].get('last_reset')
     
@@ -215,21 +269,21 @@ def reset_daily_usage_if_needed(user_id):
         if now.date() > last_reset.date():
             user_usage[user_id]['daily_bytes'] = 0
             user_usage[user_id]['last_reset'] = now.isoformat()
-            logging.info(f"Reset quotidien pour user {user_id}")
+            logging.info(f"Daily reset for user {user_id}")
     else:
         user_usage[user_id]['last_reset'] = now.isoformat()
 
 def check_user_limits(user_id, file_size):
-    """Vérifie les limites de l'utilisateur"""
+    """Checks user limits"""
     reset_daily_usage_if_needed(user_id)
     
-    # Vérifier la limite quotidienne
+    # Check daily limit
     current_daily = user_usage[user_id]['daily_bytes']
     if current_daily + file_size > DAILY_LIMIT_BYTES:
         remaining = DAILY_LIMIT_BYTES - current_daily
         return False, f"Daily limit reached! Used: {human_readable_size(current_daily)}/{human_readable_size(DAILY_LIMIT_BYTES)}. Remaining: {human_readable_size(remaining)}"
     
-    # Vérifier le délai entre les fichiers
+    # Check cooldown between files
     last_file_time = user_usage[user_id].get('last_file_time')
     if last_file_time:
         last_file_time = datetime.fromisoformat(last_file_time)
@@ -241,13 +295,13 @@ def check_user_limits(user_id, file_size):
     return True, "OK"
 
 def update_user_usage(user_id, file_size):
-    """Met à jour l'utilisation de l'utilisateur"""
+    """Updates user usage"""
     user_usage[user_id]['daily_bytes'] += file_size
     user_usage[user_id]['last_file_time'] = datetime.now().isoformat()
     save_user_usage()
 
 def get_user_usage_info(user_id):
-    """Retourne les informations d'utilisation de l'utilisateur"""
+    """Returns user usage information"""
     reset_daily_usage_if_needed(user_id)
     daily_used = user_usage[user_id]['daily_bytes']
     daily_remaining = DAILY_LIMIT_BYTES - daily_used
@@ -260,20 +314,20 @@ def get_user_usage_info(user_id):
     }
 
 async def cleanup_user_files(user_id):
-    """Nettoie tous les fichiers d'un utilisateur (sauf thumbnails)"""
+    """Cleans up all user files (except thumbnails)"""
     try:
-        # Supprimer les fichiers temporaires de l'utilisateur
+        # Delete user's temporary files
         for filename in os.listdir(TEMP_DIR):
             if filename.startswith(f"{user_id}_"):
                 filepath = os.path.join(TEMP_DIR, filename)
                 try:
                     if os.path.isfile(filepath):
                         os.remove(filepath)
-                        logging.info(f"Fichier utilisateur supprimé: {filename}")
+                        logging.info(f"User file deleted: {filename}")
                 except Exception as e:
-                    logging.error(f"Erreur suppression fichier {filename}: {e}")
+                    logging.error(f"Error deleting file {filename}: {e}")
         
-        # Nettoyer les sessions
+        # Clean up sessions
         if user_id in user_sessions:
             if 'temp_path' in user_sessions[user_id]:
                 try:
@@ -282,42 +336,66 @@ async def cleanup_user_files(user_id):
                     pass
             del user_sessions[user_id]
             
-        logging.info(f"Nettoyage complet effectué pour user {user_id}")
+        logging.info(f"Full cleanup completed for user {user_id}")
         return True
     except Exception as e:
-        logging.error(f"Erreur nettoyage user {user_id}: {e}")
+        logging.error(f"Error cleaning up user {user_id}: {e}")
         return False
 
+# PERIODIC FILE LOCAL CLEANUP FUNCTION
+async def cleanup_old_downloads():
+    """Cleans up files older than 7 days"""
+    try:
+        current_time = time.time()
+        for user_folder in os.listdir(DOWNLOAD_DIR):
+            user_path = os.path.join(DOWNLOAD_DIR, user_folder)
+            if os.path.isdir(user_path):
+                for filename in os.listdir(user_path):
+                    file_path = os.path.join(user_path, filename)
+                    if os.path.isfile(file_path):
+                        file_age = current_time - os.path.getmtime(file_path)
+                        if file_age > 7 * 24 * 3600:  # 7 days
+                            try:
+                                os.remove(file_path)
+                                logging.info(f"Deleted old file: {file_path}")
+                            except:
+                                pass
+    except Exception as e:
+        logging.error(f"Error in cleanup_old_downloads: {e}")
+
 async def auto_cleanup_task():
-    """Tâche de nettoyage automatique qui s'exécute toutes les heures"""
+    """Automatic cleanup task that runs every hour"""
     while True:
         try:
-            await asyncio.sleep(3600)  # 1 heure
+            await asyncio.sleep(3600)  # 1 hour
             
-            # Nettoyer les sessions expirées
+            # Clean up expired sessions
             await clean_old_sessions()
             
-            # Nettoyer les fichiers orphelins
+            # Clean up orphaned files
             current_time = time.time()
             for filename in os.listdir(TEMP_DIR):
                 filepath = os.path.join(TEMP_DIR, filename)
                 if os.path.isfile(filepath):
                     file_age = current_time - os.path.getmtime(filepath)
-                    if file_age > 3600:  # Plus d'1 heure
+                    if file_age > 3600:  # More than 1 hour
                         try:
                             os.remove(filepath)
-                            logging.info(f"Fichier orphelin supprimé: {filename}")
+                            logging.info(f"Orphaned file deleted: {filename}")
                         except Exception as e:
-                            logging.error(f"Erreur suppression orphelin {filename}: {e}")
+                            logging.error(f"Error deleting orphaned {filename}: {e}")
             
-            logging.info("Nettoyage automatique effectué")
+            # Clean up old downloads
+            await cleanup_old_downloads()
+            
+            logging.info("Automatic cleanup completed")
             
         except Exception as e:
-            logging.error(f"Erreur nettoyage automatique: {e}")
-            await asyncio.sleep(300)  # Attendre 5 minutes en cas d'erreur
+            logging.error(f"Automatic cleanup error: {e}")
+            await asyncio.sleep(300)  # Wait 5 minutes in case of error
 
 def human_readable_size(size_bytes):
-    """Convertit une taille en bytes en format lisible"""
+    """Converts bytes to a human-readable format"""
     if size_bytes == 0:
         return "0B"
     size_name = ("B", "KB", "MB", "GB", "TB")
@@ -327,24 +405,24 @@ def human_readable_size(size_bytes):
     return "{} {}".format(s, size_name[i])
 
 def sanitize_filename(filename):
-    """Nettoie le nom de fichier pour éviter les problèmes"""
-    # Supprimer les caractères interdits
+    """Cleans up the filename to avoid issues"""
+    # Remove forbidden characters
     filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-    # Supprimer les espaces en début/fin
+    # Remove spaces at beginning/end
     filename = filename.strip('. ')
-    # Limiter la longueur
+    # Limit length
     name, ext = os.path.splitext(filename)
     if len(name) > 200:
         name = name[:200]
     return name + ext
 
 def get_video_duration(file_path):
-    """Obtenir la durée d'une vidéo avec ffprobe"""
+    """Gets the duration of a video with ffprobe"""
     try:
         import subprocess
         import json
         
-        # Si ffprobe n'est pas disponible, retourner None
+        # If ffprobe is not available, return None
         if not shutil.which("ffprobe"):
             return None
             
@@ -364,7 +442,7 @@ def get_video_duration(file_path):
     return None
 
 def get_video_dimensions(file_path):
-    """Obtenir les dimensions d'une vidéo avec ffprobe"""
+    """Gets the dimensions of a video with ffprobe"""
     try:
         import subprocess
         import json
@@ -391,9 +469,10 @@ def get_video_dimensions(file_path):
     return None, None
 
 async def progress_callback(current, total, event, start_time, progress_msg, action="Downloading", last_update_time=None):
-    """Callback pour afficher la progression"""
+    """Callback to display progress"""
     now = time.time()
     
+    # Avoid too frequent updates
     if last_update_time is not None:
         if now - last_update_time[0] < PROGRESS_UPDATE_INTERVAL:
             return
@@ -401,7 +480,7 @@ async def progress_callback(current, total, event, start_time, progress_msg, act
     
     diff = now - start_time
     
-    # Éviter la division par zéro au tout début
+    # Avoid division by zero at the very beginning
     if diff == 0:
         diff = 1
 
@@ -430,17 +509,25 @@ async def progress_callback(current, total, event, start_time, progress_msg, act
         time_to_completion
     )
     
+    # Avoid redundant edits by checking the last text
+    if hasattr(progress_msg, '_last_progress_text') and progress_msg._last_progress_text == text:
+        return
+    
     try:
-        await progress_msg.edit(text, parse_mode='html')
+        await safe_edit(progress_msg, text, parse_mode='html')
+        # Store the last sent text
+        progress_msg._last_progress_text = text
     except FloodWaitError as e:
         logging.warning(f"Rate limit hit in progress_callback. Sleeping for {e.seconds} seconds.")
         await asyncio.sleep(e.seconds)
-    except Exception:
-        # Ignorer les autres erreurs d'édition (par exemple, message non modifié)
+    except Exception as e:
+        # Silently ignore edit errors
+        if "message not modified" not in str(e).lower():
+            logging.debug(f"Progress callback error: {e}")
         pass
 
 async def clean_old_sessions():
-    """Nettoie les sessions expirées"""
+    """Cleans up expired sessions"""
     current_time = datetime.now()
     expired_users = []
     
@@ -456,7 +543,7 @@ async def clean_old_sessions():
                 pass
         del user_sessions[user_id]
 
-# 🔥 HANDLER POUR LE BOUTON "J'ai rejoint" 🔥
+# 🔥 HANDLER FOR THE "I HAVE JOINED" BUTTON 🔥
 @bot.on(events.CallbackQuery(data="check_joined"))
 async def check_joined_handler(event):
     user_id = event.query.user_id
@@ -464,31 +551,31 @@ async def check_joined_handler(event):
     if await is_user_in_channel(user_id):
         await event.answer("✅ Thank you! You can now use the bot.", alert=True)
         await event.delete()
-        # Afficher le message de bienvenue
+        # Show welcome message
         await bot.send_message(user_id, "/start")
     else:
         await event.answer("❌ You haven't joined the channel yet!", alert=True)
 
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
-    """Handler amélioré pour la commande /start"""
+    """Improved handler for the /start command"""
     user_id = event.sender_id
     
-    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    # 🔥 FORCE JOIN CHECK 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(event)
         return
     
-    # Charger les données si pas déjà fait
+    # Load data if not already done
     if not hasattr(start_handler, 'data_loaded'):
         load_user_usage()
         load_user_preferences()
         start_handler.data_loaded = True
     
-    # Obtenir les informations d'utilisation
+    # Get usage information
     usage_info = get_user_usage_info(user_id)
     
-    # Vérifier si l'utilisateur a un texte personnalisé
+    # Check if user has a custom text
     custom_text = sessions.get(user_id, {}).get('custom_text', '')
     
     welcome_text = """👋 <b>Welcome to Advanced File Rename Bot!</b>
@@ -522,7 +609,7 @@ Send me any file and I'll help you rename it.
 
 <b>📤 Just send me a file to get started!</b>"""
     
-    # Bouton Settings
+    # Settings button
     keyboard = [
         [Button.inline("⚙️ Settings", "show_settings")]
     ]
@@ -531,7 +618,7 @@ Send me any file and I'll help you rename it.
 
 @bot.on(events.NewMessage(pattern='/cancel'))
 async def cancel_handler(event):
-    """Handler pour annuler l'opération en cours"""
+    """Handler to cancel the current operation"""
     user_id = event.sender_id
     
     if user_id in user_sessions:
@@ -547,10 +634,10 @@ async def cancel_handler(event):
 
 @bot.on(events.NewMessage(pattern='/status'))
 async def status_handler(event):
-    """Handler pour vérifier le statut du bot"""
+    """Handler to check bot status"""
     active_sessions = len(user_sessions)
     
-    # Vérifier l'espace disque (Windows compatible)
+    # Check disk space (Windows compatible)
     if os.name == 'nt':  # Windows
         import shutil
         total, used, free = shutil.disk_usage(TEMP_DIR)
@@ -559,7 +646,7 @@ async def status_handler(event):
         stat = os.statvfs(TEMP_DIR)
         free_space = stat.f_bavail * stat.f_frsize
     
-    # Vérifier ffmpeg
+    # Check ffmpeg
     ffmpeg_status = "✅ Available" if shutil.which("ffmpeg") else "❌ Not available"
     
     status_text = """🤖 <b>Bot Status</b>
@@ -585,17 +672,17 @@ async def status_handler(event):
 
 @bot.on(events.NewMessage(pattern='/usage'))
 async def usage_handler(event):
-    """Handler pour vérifier l'utilisation de l'utilisateur"""
+    """Handler to check user usage"""
     user_id = event.sender_id
     
-    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    # 🔥 FORCE JOIN CHECK 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(event)
         return
     
     usage_info = get_user_usage_info(user_id)
     
-    # Créer une barre de progression
+    # Create a progress bar
     progress_bar_length = 20
     completed_length = int((usage_info['percentage'] / 100) * progress_bar_length)
     progress_bar = '█' * completed_length + '░' * (progress_bar_length - completed_length)
@@ -624,10 +711,10 @@ async def usage_handler(event):
 
 @bot.on(events.NewMessage(pattern='/settings'))
 async def settings_command(event):
-    """Handler pour la commande /settings"""
+    """Handler for the /settings command"""
     user_id = event.sender_id
     
-    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    # 🔥 FORCE JOIN CHECK 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(event)
         return
@@ -635,10 +722,10 @@ async def settings_command(event):
     await show_settings_menu(event)
 
 async def show_settings_menu(event):
-    """Affiche le menu des paramètres"""
+    """Displays the settings menu"""
     user_id = event.sender_id if hasattr(event, 'sender_id') else event.query.user_id
     
-    # Charger les préférences si nécessaire
+    # Load preferences if necessary
     if user_id not in sessions:
         sessions[user_id] = {}
     
@@ -676,17 +763,17 @@ async def show_settings_menu(event):
 
 @bot.on(events.NewMessage(pattern='/cleanup'))
 async def cleanup_handler(event):
-    """Handler pour nettoyer les fichiers de l'utilisateur (admin seulement)"""
+    """Handler to clean up user files (admin only)"""
     user_id = event.sender_id
     
-    # Vérifier si l'utilisateur est admin
+    # Check if user is admin
     admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()] if ADMIN_IDS else []
     
     if user_id not in admin_list:
         await event.reply("❌ <b>Access denied.</b> This command is for administrators only.", parse_mode='html')
         return
     
-    # Nettoyer les fichiers de l'utilisateur
+    # Clean up user files
     success = await cleanup_user_files(user_id)
     
     if success:
@@ -696,15 +783,15 @@ async def cleanup_handler(event):
 
 @bot.on(events.NewMessage(pattern='/setthumb'))
 async def setthumb_handler(event):
-    """Handler pour définir une miniature"""
+    """Handler to set a thumbnail"""
     user_id = event.sender_id
     
-    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    # 🔥 FORCE JOIN CHECK 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(event)
         return
     
-    # Stocker que l'utilisateur veut définir un thumbnail
+    # Store that the user wants to set a thumbnail
     user_sessions[user_id] = {
         'action': 'set_thumbnail',
         'timestamp': datetime.now()
@@ -722,10 +809,10 @@ async def setthumb_handler(event):
 
 @bot.on(events.NewMessage(pattern='/delthumb'))
 async def delthumb_handler(event):
-    """Handler pour supprimer la miniature"""
+    """Handler to delete the thumbnail"""
     user_id = event.sender_id
     
-    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    # 🔥 FORCE JOIN CHECK 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(event)
         return
@@ -743,10 +830,10 @@ async def delthumb_handler(event):
 
 @bot.on(events.NewMessage(pattern='/showthumb'))
 async def showthumb_handler(event):
-    """Handler pour afficher la miniature actuelle"""
+    """Handler to display the current thumbnail"""
     user_id = event.sender_id
     
-    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    # 🔥 FORCE JOIN CHECK 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(event)
         return
@@ -764,12 +851,12 @@ async def showthumb_handler(event):
 
 @bot.on(events.NewMessage(func=lambda e: e.photo))
 async def photo_handler(event):
-    """Handler pour les photos (thumbnails)"""
+    """Handler for photos (thumbnails)"""
     user_id = event.sender_id
     
-    # Vérifier si l'utilisateur est en mode set_thumbnail
+    # Check if user is in set_thumbnail mode
     if user_id in user_sessions and user_sessions[user_id].get('action') == 'set_thumbnail':
-        # Vérifier la taille
+        # Check size
         if event.file.size > MAX_THUMB_SIZE:
             await event.reply(
                 "❌ <b>Photo too large!</b>\n\n"
@@ -783,29 +870,29 @@ async def photo_handler(event):
             del user_sessions[user_id]
             return
         
-        # Sauvegarder la miniature
+        # Save the thumbnail
         thumb_path = os.path.join(THUMBNAIL_DIR, "{}.jpg".format(user_id))
         
         try:
-            # Message de progression
+            # Progress message
             progress_msg = await event.reply("⏳ <b>Saving thumbnail...</b>", parse_mode='html')
             
-            # Télécharger la photo
+            # Download the photo
             await event.download_media(file=thumb_path)
             
-            # Confirmer
-            await progress_msg.edit(
+            # Confirm
+            await safe_edit(progress_msg,
                 "✅ <b>Thumbnail saved successfully!</b>\n\n"
                 "This thumbnail will be used for all your renamed files.\n"
                 "Use /delthumb to remove it.",
                 parse_mode='html'
             )
             
-            # Nettoyer la session
+            # Clean up the session
             del user_sessions[user_id]
             
         except Exception as e:
-            await progress_msg.edit(
+            await safe_edit(progress_msg,
                 "❌ <b>Error saving thumbnail:</b> {}".format(str(e)),
                 parse_mode='html'
             )
@@ -814,20 +901,20 @@ async def photo_handler(event):
 
 @bot.on(events.NewMessage(func=lambda e: e.file and not e.photo))
 async def file_handler(event):
-    """Handler principal pour les fichiers (pas les photos)"""
+    """Main handler for files (not photos)"""
     user_id = event.sender_id
     
-    # 🔥 VÉRIFICATION FORCE JOIN 🔥
+    # 🔥 FORCE JOIN CHECK 🔥
     if not await is_user_in_channel(user_id):
         await send_force_join_message(event)
         return
     
-    # Nettoyer les anciennes sessions
+    # Clean up old sessions
     await clean_old_sessions()
     
     file = event.file
     
-    # Vérifier la taille du fichier
+    # Check file size
     if file.size > MAX_FILE_SIZE:
         await event.reply(
             "❌ <b>File too large!</b>\n\n"
@@ -840,7 +927,7 @@ async def file_handler(event):
         )
         return
     
-    # Vérifier les limites de l'utilisateur
+    # Check user limits
     limit_ok, limit_message = check_user_limits(user_id, file.size)
     if not limit_ok:
         await event.reply(
@@ -849,33 +936,33 @@ async def file_handler(event):
         )
         return
     
-    # Obtenir les informations du fichier
+    # Get file information
     file_name = file.name or "unnamed_file"
     file_size = human_readable_size(file.size)
     extension = os.path.splitext(file_name)[1] or ""
     mime_type = file.mime_type or "unknown"
     
-    # Vérifier si c'est une vidéo
+    # Check if it's a video
     is_video = mime_type.startswith('video/') or extension.lower() in ['.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv']
     
-    # Stocker les informations de session
+    # Store session information
     user_sessions[user_id] = {
         'message': event.message,
         'file_name': file_name,
         'timestamp': datetime.now(),
         'action': None,
         'is_video': is_video,
-        'file_size': file.size  # Stocker la taille pour la mise à jour de l'utilisation
+        'file_size': file.size  # Store size for usage update
     }
     
-    # Créer les boutons
+    # Create buttons
     buttons = [
         [Button.inline("🖼️ Add Thumbnail", f"add_thumb_{user_id}")],
         [Button.inline("✏️ Rename Only", f"rename_only_{user_id}")],
         [Button.inline("❌ Cancel", f"cancel_{user_id}")]
     ]
     
-    # Obtenir les informations d'utilisation pour l'affichage
+    # Get usage information for display
     usage_info = get_user_usage_info(user_id)
     
     info_text = """📁 <b>FILE INFORMATION</b>
@@ -906,7 +993,7 @@ async def file_handler(event):
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
-    """Handler optimisé pour les boutons inline"""
+    """Optimized handler for inline buttons"""
     data = event.data.decode('utf-8')
     user_id = event.query.user_id
     
@@ -1043,175 +1130,33 @@ Send /cancel to abort."""
                 await event.answer("❌ No thumbnail set! Use /setthumb first.", alert=True)
                 return
             
-            try:
-                # ⚡ UPLOAD RAPIDE AVEC THUMBNAIL INTÉGRÉ
-                await event.edit("⚡ <b>Processing with thumbnail...</b>", parse_mode='html')
-                
-                original_msg = user_sessions[user_id]['message']
-                file_name = user_sessions[user_id]['file_name']
-                file_size = user_sessions[user_id]['file_size']
-                is_video = user_sessions[user_id].get('is_video', False)
-                
-                # Appliquer les modifications de nom si configurées
-                clean_tags = sessions.get(user_id, {}).get('clean_tags', True)
-                if clean_tags:
-                    file_name = clean_filename_text(file_name)
-                
-                custom_text = sessions.get(user_id, {}).get('custom_text', '')
-                text_position = sessions.get(user_id, {}).get('text_position', 'end')
-                
-                if custom_text:
-                    file_name = add_custom_text_to_filename(file_name, custom_text, text_position)
-                
-                custom_username = sessions.get(user_id, {}).get('custom_username', '')
-                if custom_username:
-                    file_name = add_custom_text_to_filename(file_name, custom_username, text_position)
-                
-                sanitized_name = sanitize_filename(file_name)
-                
-                # Créer un fichier temporaire pour le traitement
-                temp_filename = f"{user_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-                temp_path = os.path.join(TEMP_DIR, temp_filename)
-                
-                # Télécharger le fichier avec progression
-                await event.edit("⬇️ <b>Downloading...</b>", parse_mode='html')
-                
-                start_time = time.time()
-                last_update_time = [start_time]
-                
-                async def download_progress(current, total):
-                    now = time.time()
-                    if now - last_update_time[0] < 3:  # Update toutes les 3 secondes
-                        return
-                    last_update_time[0] = now
-                    
-                    percentage = current * 100 / total
-                    speed = current / (now - start_time)
-                    eta = int((total - current) / speed) if speed > 0 else 0
-                    
-                    try:
-                        await event.edit(
-                            f"⬇️ <b>Downloading...</b>\n\n"
-                            f"Progress: {percentage:.1f}%\n"
-                            f"Speed: {human_readable_size(speed)}/s\n"
-                            f"ETA: {eta}s",
-                            parse_mode='html'
-                        )
-                    except:
-                        pass
-                
-                path = await original_msg.download_media(
-                    file=temp_path,
-                    progress_callback=download_progress
-                )
-                
-                if not path or not os.path.exists(path):
-                    raise Exception("Failed to download file")
-                
-                if path != temp_path:
-                    shutil.move(path, temp_path)
-                
-                # Pour les vidéos, intégrer le thumbnail avec FFmpeg
-                if is_video and shutil.which("ffmpeg"):
-                    await event.edit("🎬 <b>Adding thumbnail to video...</b>", parse_mode='html')
-                    
-                    output_path = temp_path + "_with_thumb.mp4"
-                    
-                    # Commande FFmpeg pour ajouter le thumbnail
-                    cmd = [
-                        'ffmpeg', '-i', temp_path,
-                        '-i', thumb_path,
-                        '-map', '0:v', '-map', '0:a',
-                        '-map', '1:v', '-c', 'copy',
-                        '-c:v:1', 'mjpeg', '-disposition:v:1', 'attached_pic',
-                        output_path,
-                        '-hide_banner', '-loglevel', 'error'
-                    ]
-                    
-                    process = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    stdout, stderr = await process.communicate()
-                    
-                    if process.returncode == 0:
-                        # Remplacer le fichier original par celui avec thumbnail
-                        os.remove(temp_path)
-                        temp_path = output_path
-                    else:
-                        logging.error(f"FFmpeg failed: {stderr.decode()}")
-                        # Continuer sans thumbnail intégré
-                
-                # Pour les autres types de fichiers, utiliser le thumbnail comme preview
-                # (Le thumbnail sera visible dans Telegram mais pas intégré dans le fichier)
-                elif not is_video:
-                    await event.edit("📄 <b>Processing document with thumbnail...</b>", parse_mode='html')
-                
-                # Upload du fichier avec thumbnail intégré
-                await event.edit("📤 <b>Uploading with thumbnail...</b>", parse_mode='html')
-                
-                # Récupérer les attributs vidéo si c'est une vidéo
-                video_attributes = []
-                if is_video:
-                    duration = get_video_duration(temp_path)
-                    width, height = get_video_dimensions(temp_path)
-                    
-                    if duration or (width and height):
-                        video_attr = DocumentAttributeVideo(
-                            duration=duration or 0,
-                            w=width or 0,
-                            h=height or 0,
-                            supports_streaming=True
-                        )
-                        video_attributes.append(video_attr)
-                
-                # Attributs du fichier
-                file_attributes = [DocumentAttributeFilename(sanitized_name)]
-                if video_attributes:
-                    file_attributes.extend(video_attributes)
-                
-                # Upload avec thumbnail intégré ou preview
-                thumb_to_use = None
-                if not is_video:
-                    # Pour les documents, utiliser le thumbnail comme preview
-                    thumb_to_use = thumb_path
-                
-                # Créer la caption avec le nom du fichier
-                caption = f"<code>{sanitized_name}</code>"
-                
-                await bot.send_file(
-                    event.chat_id,
-                    temp_path,
-                    caption=caption,
-                    parse_mode='html',
-                    file_name=sanitized_name,
-                    thumb=thumb_to_use,  # Thumbnail pour preview (documents)
-                    supports_streaming=False,  # Force l'affichage du nom
-                    force_document=True,       # Force l'envoi en document
-                    attributes=file_attributes
-                )
-                
-                # Mise à jour de l'utilisation
-                update_user_usage(user_id, file_size)
-                
-                # Nettoyage
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
-                
-                await event.delete()
-                del user_sessions[user_id]
-                
-            except Exception as e:
-                await event.edit(f"❌ <b>Error:</b> {str(e)}", parse_mode='html')
-                # Nettoyage en cas d'erreur
-                try:
-                    if 'temp_path' in locals() and os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except:
-                    pass
+            # Get file info
+            file_info = user_sessions[user_id]
+            file_name = file_info['file_name']
+            file_size = human_readable_size(file_info['file_size'])
+            extension = os.path.splitext(file_name)[1] or "Unknown"
+            original_msg = file_info['message']
+            mime_type = original_msg.file.mime_type or "Unknown"
+            dc_id = original_msg.file.dc_id if hasattr(original_msg.file, 'dc_id') else "N/A"
+            
+            # Display MEDIA INFO card
+            info_card = f"""📁 <b>MEDIA INFO</b>
+
+📁 <b>FILE NAME:</b> <code>{file_name}</code>
+🧩 <b>EXTENSION:</b> <code>{extension}</code>
+📦 <b>FILE SIZE:</b> {file_size}
+🪄 <b>MIME TYPE:</b> {mime_type}
+🧭 <b>DC ID:</b> {dc_id}
+
+<b>PLEASE ENTER THE NEW FILENAME WITH EXTENSION AND REPLY THIS MESSAGE.</b>"""
+            
+            # Store action
+            user_sessions[user_id]['action'] = 'add_thumbnail_rename'
+            
+            # Send message and store ID AND message object
+            ask_msg = await event.edit(info_card, parse_mode='html')
+            user_sessions[user_id]['reply_id'] = ask_msg.id
+            user_sessions[user_id]['media_info_msg'] = ask_msg  # NEW: store message object
         else:
             await event.answer("❌ This is not for you or session expired.", alert=True)
             
@@ -1223,13 +1168,14 @@ Send /cancel to abort."""
                 "✏️ **Please send me the new filename** (including extension).",
                 buttons=Button.inline("❌ Cancel", f"cancel_{user_id}")
             )
-            # Store message ID to ensure user replies to the correct message
+            # Store message ID AND message object
             user_sessions[user_id]['reply_id'] = ask_msg.id
+            user_sessions[user_id]['rename_prompt_msg'] = ask_msg  # NEW
         else:
             await event.answer("❌ This is not for you or the session has expired.", alert=True)
 
     elif data == 'help':
-        # Message d'aide détaillé
+        # Detailed help message
         help_text = """📚 <b>How to use this bot:</b>
 
 1️⃣ Send me any file (document, video, audio)
@@ -1240,7 +1186,7 @@ Send /cancel to abort."""
 <b>💡 Tips:</b>
 • Use descriptive filenames
 • Keep the correct extension
-• Avoid special characters like / \ : * ? " < > |
+• Avoid special characters like / \\ : * ? " < > |
 • Maximum file size: 2 GB
 
 <b>⚡ Commands:</b>
@@ -1249,17 +1195,17 @@ Send /cancel to abort."""
 /status - Check bot status"""
         
         await event.respond(help_text, parse_mode='html')
-        await event.answer("ℹ️ Help sent!")  # Petite notification
+        await event.answer("ℹ️ Help sent!")  # Small notification
 
 @bot.on(events.NewMessage(func=lambda e: e.text and e.is_private and not e.text.startswith('/')))
 async def text_handler(event):
-    """Handler pour les messages texte"""
+    """Handler for text messages"""
     user_id = event.sender_id
     
     if user_id not in sessions:
         return
     
-    # Si on attend un texte personnalisé
+    # If waiting for custom text
     if sessions[user_id].get('awaiting_custom_text'):
         custom_text = event.text.strip()
         
@@ -1267,11 +1213,11 @@ async def text_handler(event):
             await event.reply("❌ Text too long! Maximum 50 characters.")
             return
         
-        # Sauvegarder le texte
+        # Save the text
         sessions[user_id]['custom_text'] = custom_text
         sessions[user_id]['awaiting_custom_text'] = False
         
-        # Position par défaut
+        # Default position
         if 'text_position' not in sessions[user_id]:
             sessions[user_id]['text_position'] = 'end'
         
@@ -1285,7 +1231,7 @@ async def text_handler(event):
             parse_mode='html'
         )
         return
-    # Si on attend un username personnalisé
+    # If waiting for custom username
     if sessions[user_id].get('awaiting_custom_username'):
         username = event.text.strip()
         if not username.startswith('@') or len(username) > 64:
@@ -1304,44 +1250,73 @@ async def text_handler(event):
 
 @bot.on(events.NewMessage(func=lambda e: e.is_reply))
 async def rename_handler(event):
-    """Handler pour renommer les fichiers"""
+    """Improved handler for renaming files"""
     user_id = event.sender_id
     
-    # Vérifier si c'est une réponse valide et si l'action est 'rename_only'
-    if user_id not in user_sessions or user_sessions[user_id].get('action') != 'rename_only':
+    # Check if user has an active session
+    if user_id not in user_sessions:
         return
     
-    # Nettoyer les anciennes sessions
+    action = user_sessions[user_id].get('action')
+    if action not in ['rename_only', 'add_thumbnail_rename']:
+        return
+    
+    # Clean up old sessions
     await clean_old_sessions()
     
-    # Vérifier si la session n'a pas expiré
+    # Check if session has expired
     if user_id not in user_sessions:
         await event.reply("⏱ Session expired. Please send the file again.")
         return
     
     reply_to = await event.get_reply_message()
-    # Ensure the user is replying to the "send me new name" message
+    # Ensure user replies to the correct message
     if reply_to.id != user_sessions[user_id].get('reply_id'):
         return
     
     new_name = event.text.strip()
     
-    # Valider le nouveau nom
+    # Validate new name
     if not new_name:
         await event.reply("❌ Please provide a valid filename.")
         return
     
+    # Add extension if missing
+    extension_added = False
     if "." not in new_name and "." in user_sessions[user_id]['file_name']:
-        # Ajouter l'extension originale si oubliée
         original_ext = os.path.splitext(user_sessions[user_id]['file_name'])[1]
         new_name += original_ext
-        await event.reply("ℹ️ Extension added automatically: <code>{}</code>".format(new_name), parse_mode='html')
-
-    # Lancer le traitement du fichier pour le renommage sans miniature
-    await process_file(event, user_id, new_name=new_name, use_thumb=False)
+        extension_added = True
+        await event.reply(f"ℹ️ Extension added automatically: <code>{new_name}</code>", parse_mode='html')
+    
+    # Process based on action
+    try:
+        if action == 'rename_only':
+            await fast_rename_only(event, user_id, new_name)
+        elif action == 'add_thumbnail_rename':
+            await process_with_thumbnail(event, user_id, new_name)
+        
+        # NEW: Delete MEDIA INFO message if present
+        if 'media_info_msg' in user_sessions.get(user_id, {}):
+            try:
+                await user_sessions[user_id]['media_info_msg'].delete()
+            except:
+                pass  # Ignore if already deleted
+        
+        # NEW: Delete rename_only prompt message if present
+        if 'rename_prompt_msg' in user_sessions.get(user_id, {}):
+            try:
+                await user_sessions[user_id]['rename_prompt_msg'].delete()
+            except:
+                pass  # Ignore if already deleted
+                
+    except Exception as e:
+        # If an error occurs, handle it here
+        if "Content of the message was not modified" not in str(e):
+            raise
 
 async def process_file(event, user_id, new_name=None, use_thumb=False):
-    """Fonction générique pour traiter (télécharger et uploader) un fichier."""
+    """Generic function to process (download and upload) a file."""
     
     if user_id not in user_sessions:
         # Session might have expired or been cancelled
@@ -1356,17 +1331,17 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
             new_name = user_sessions[user_id]['file_name']
         
         sanitized_name = sanitize_filename(new_name)
-        # Ajout du custom text si présent
+        # Add custom text if present
         custom_text = sessions.get(user_id, {}).get('custom_text', '')
         text_position = sessions.get(user_id, {}).get('text_position', 'end')
         if custom_text:
             sanitized_name = add_custom_text_to_filename(sanitized_name, custom_text, text_position)
-        # Ajout du username custom si présent
+        # Add custom username if present
         custom_username = sessions.get(user_id, {}).get('custom_username', '')
         if custom_username:
             sanitized_name = add_custom_text_to_filename(sanitized_name, custom_username, text_position)
         
-        # Message de progression
+        # Progress message
         if isinstance(event, events.CallbackQuery.Event):
              progress_msg = await event.edit("⏳ <b>Processing...</b>", parse_mode='html')
         else:
@@ -1403,7 +1378,7 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
         
         upload_path = temp_path
         
-        # Récupérer les attributs vidéo si c'est une vidéo
+        # Get video attributes if it's a video
         video_attributes = []
         if is_video:
             duration = get_video_duration(temp_path)
@@ -1418,10 +1393,10 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
                 )
                 video_attributes.append(video_attr)
         
-        # SKIP FFmpeg - pas nécessaire pour renommage simple
-        # Optimisation désactivée pour améliorer les performances
+        # SKIP FFmpeg - not necessary for simple renaming
+        # Optimization disabled to improve performance
         
-        await progress_msg.edit("📤 <b>Uploading file...</b>", parse_mode='html')
+        await safe_edit(progress_msg, "📤 <b>Uploading file...</b>", parse_mode='html')
         
         start_time = time.time()
         last_update_time_upload = [start_time]
@@ -1435,52 +1410,52 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
             if os.path.exists(thumb_path):
                 thumb_to_use = thumb_path
         
-        # Ajouter l'attribut filename
+        # Add filename attribute
         file_attributes = [DocumentAttributeFilename(sanitized_name)]
         
-        # Ajouter les attributs vidéo si disponibles
+        # Add video attributes if available
         if video_attributes:
             file_attributes.extend(video_attributes)
         
-        # Créer la caption avec le nom du fichier
+        # Create caption with filename
         caption = f"<code>{sanitized_name}</code>"
         
-        # Envoyer le fichier avec tous les attributs nécessaires
+        # Send file with all necessary attributes
         await event.client.send_file(
             event.chat_id,
             upload_path,
-            caption=caption,  # Caption avec le nom du fichier
+            caption=caption,  # Caption with filename
             parse_mode='html',
             file_name=sanitized_name,
             thumb=thumb_to_use,
-            supports_streaming=False,  # Force l'affichage du nom
-            force_document=True,       # Force l'envoi en document
+            supports_streaming=False,  # Force name display
+            force_document=True,       # Force sending as document
             attributes=file_attributes,
             progress_callback=upload_progress,
-            part_size_kb=512  # Chunks optimisés pour de meilleures performances
+            part_size_kb=512  # Optimized chunks for better performance
         )
         
         await progress_msg.delete()
         
-        # Mettre à jour l'utilisation de l'utilisateur après un traitement réussi
+        # Update user usage after successful processing
         if user_id in user_sessions and 'file_size' in user_sessions[user_id]:
             update_user_usage(user_id, user_sessions[user_id]['file_size'])
             logging.info(f"Usage updated for user {user_id}: +{human_readable_size(user_sessions[user_id]['file_size'])}")
         
     except FloodWaitError as e:
         if progress_msg:
-             await progress_msg.edit("⏳ Rate limit hit. Please wait {} seconds.".format(e.seconds))
+             await safe_edit(progress_msg, "⏳ Rate limit hit. Please wait {} seconds.".format(e.seconds))
         else:
             await event.reply("⏳ Rate limit hit. Please wait {} seconds.".format(e.seconds))
     except Exception as e:
         error_msg = "❌ <b>Error:</b> {}\n\nPlease try again.".format(str(e))
         if progress_msg:
-            await progress_msg.edit(error_msg, parse_mode='html')
+            await safe_edit(progress_msg, error_msg, parse_mode='html')
         else:
             await event.reply(error_msg, parse_mode='html')
         
     finally:
-        # Nettoyage amélioré
+        # Improved cleanup
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -1496,8 +1471,282 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
         if user_id in user_sessions:
             del user_sessions[user_id]
 
+async def fast_rename_only(event, user_id, new_name):
+    """Ultra-fast file rename without re-upload or thumbnail logic."""
+    if user_id not in user_sessions:
+        return
+
+    progress_msg = None
+    try:
+        # Clean up name
+        sanitized_name = sanitize_filename(new_name)
+        # Keep original extension if missing
+        original_filename = user_sessions[user_id]['file_name']
+        file_extension = os.path.splitext(original_filename)[1]
+        if not sanitized_name.endswith(file_extension):
+            sanitized_name += file_extension
+
+        # Progress message
+        progress_msg = await event.reply("⚡ <b>Renaming in progress...</b>", parse_mode='html')
+
+        original_msg = user_sessions[user_id]['message']
+        is_video = user_sessions[user_id].get('is_video', False)
+
+        # Generate unique local path per user and file id
+        file_id = original_msg.file.id
+        local_path = get_local_file_path(user_id, file_id, file_extension)
+
+        # Check if already in cache, otherwise download only once
+        if os.path.exists(local_path):
+            await safe_edit(progress_msg, "🚀 <b>File found locally!</b> No download needed.", parse_mode='html')
+        else:
+            await safe_edit(progress_msg, "📥 <b>Downloading file (1st time)...</b>", parse_mode='html')
+            downloaded_path = await original_msg.download_media(file=local_path)
+            if not downloaded_path or not os.path.exists(downloaded_path):
+                raise Exception("Failed to download file")
+            if downloaded_path != local_path:
+                shutil.move(downloaded_path, local_path)
+
+        # Create a renamed temporary copy
+        temp_renamed_path = os.path.join(TEMP_DIR, f"{user_id}_{int(time.time())}_{sanitized_name}")
+        shutil.copy2(local_path, temp_renamed_path)
+
+        # File attributes (name)
+        file_attributes = [DocumentAttributeFilename(sanitized_name)]
+        # Video attribute if needed
+        if is_video:
+            duration = get_video_duration(temp_renamed_path)
+            width, height = get_video_dimensions(temp_renamed_path)
+            if duration or (width and height):
+                video_attr = DocumentAttributeVideo(
+                    duration=duration or 0,
+                    w=width or 0,
+                    h=height or 0,
+                    supports_streaming=True
+                )
+                file_attributes.append(video_attr)
+
+        # Caption
+        caption = f"<code>{sanitized_name}</code>"
+
+        await safe_edit(progress_msg, "📤 <b>Sending renamed file...</b>", parse_mode='html')
+
+        await event.client.send_file(
+            event.chat_id,
+            temp_renamed_path,
+            caption=caption,
+            parse_mode='html',
+            file_name=sanitized_name,
+            supports_streaming=is_video,
+            force_document=not is_video,
+            attributes=file_attributes
+        )
+        await progress_msg.delete()
+
+        # Update usage if tracking is enabled
+        if 'file_size' in user_sessions[user_id]:
+            update_user_usage(user_id, user_sessions[user_id]['file_size'])
+
+        try:
+            os.remove(temp_renamed_path)
+        except:
+            pass
+
+        # Delete prompt messages before cleaning up the session
+        if 'media_info_msg' in user_sessions.get(user_id, {}):
+            try:
+                await user_sessions[user_id]['media_info_msg'].delete()
+            except:
+                pass
+        if 'rename_prompt_msg' in user_sessions.get(user_id, {}):
+            try:
+                await user_sessions[user_id]['rename_prompt_msg'].delete()
+            except:
+                pass
+        
+        del user_sessions[user_id]
+
+    except Exception as e:
+        error_msg = f"❌ <b>Error:</b> {str(e)}"
+        if progress_msg:
+            await safe_edit(progress_msg, error_msg, parse_mode='html')
+        else:
+            await event.reply(error_msg, parse_mode='html')
+        if 'temp_renamed_path' in locals() and os.path.exists(temp_renamed_path):
+            try:
+                os.remove(temp_renamed_path)
+            except:
+                pass
+        
+        # Delete prompt messages even on error
+        if user_id in user_sessions:
+            if 'media_info_msg' in user_sessions[user_id]:
+                try:
+                    await user_sessions[user_id]['media_info_msg'].delete()
+                except:
+                    pass
+            if 'rename_prompt_msg' in user_sessions[user_id]:
+                try:
+                    await user_sessions[user_id]['rename_prompt_msg'].delete()
+                except:
+                    pass
+            del user_sessions[user_id]
+
+async def process_with_thumbnail(event, user_id, new_name):
+    """Processes the file with thumbnail and new name"""
+    
+    if user_id not in user_sessions:
+        return
+    
+    progress_msg = None
+    temp_path = None
+    
+    try:
+        # Prepare name
+        sanitized_name = sanitize_filename(new_name)
+        
+        # Apply configured modifications
+        clean_tags = sessions.get(user_id, {}).get('clean_tags', True)
+        if clean_tags:
+            sanitized_name = clean_filename_text(sanitized_name)
+        
+        custom_text = sessions.get(user_id, {}).get('custom_text', '')
+        text_position = sessions.get(user_id, {}).get('text_position', 'end')
+        if custom_text:
+            sanitized_name = add_custom_text_to_filename(sanitized_name, custom_text, text_position)
+        
+        custom_username = sessions.get(user_id, {}).get('custom_username', '')
+        if custom_username:
+            sanitized_name = add_custom_text_to_filename(sanitized_name, custom_username, text_position)
+        
+        progress_msg = await event.reply("🖼️ <b>Processing with thumbnail...</b>", parse_mode='html')
+        
+        original_msg = user_sessions[user_id]['message']
+        is_video = user_sessions[user_id].get('is_video', False)
+        file_size = user_sessions[user_id]['file_size']
+        
+        # Download the file
+        temp_filename = f"{user_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        temp_path = os.path.join(TEMP_DIR, temp_filename)
+        
+        await safe_edit(progress_msg, "📥 <b>Downloading file...</b>", parse_mode='html')
+        
+        start_time = time.time()
+        async def download_progress(current, total):
+            if time.time() - start_time > 2:
+                percentage = current * 100 / total
+                text = f"📥 <b>Downloading...</b> {percentage:.1f}%"
+                
+                # Avoid redundant edits
+                if hasattr(progress_msg, '_last_progress_text') and progress_msg._last_progress_text == text:
+                    return
+                
+                await safe_edit(progress_msg, text, parse_mode='html')
+                progress_msg._last_progress_text = text
+        
+        path = await original_msg.download_media(
+            file=temp_path,
+            progress_callback=download_progress
+        )
+        
+        if not path or not os.path.exists(path):
+            raise Exception("Failed to download file")
+        
+        if path != temp_path:
+            shutil.move(path, temp_path)
+        
+        # Get the thumbnail
+        thumb_path = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
+        
+        # Prepare attributes
+        file_attributes = [DocumentAttributeFilename(sanitized_name)]
+        
+        if is_video:
+            duration = get_video_duration(temp_path)
+            width, height = get_video_dimensions(temp_path)
+            
+            if duration or (width and height):
+                video_attr = DocumentAttributeVideo(
+                    duration=duration or 0,
+                    w=width or 0,
+                    h=height or 0,
+                    supports_streaming=True
+                )
+                file_attributes.append(video_attr)
+        
+        # Minimal caption (just the name like rename_only)
+        caption = f"<code>{sanitized_name}</code>"
+        
+        await safe_edit(progress_msg, "📤 <b>Uploading with thumbnail...</b>", parse_mode='html')
+        
+        # Send with thumbnail
+        await event.client.send_file(
+            event.chat_id,
+            temp_path,
+            caption=caption,
+            parse_mode='html',
+            file_name=sanitized_name,
+            thumb=thumb_path,
+            supports_streaming=is_video,
+            force_document=not is_video,
+            attributes=file_attributes
+        )
+        
+        await progress_msg.delete()
+        
+        # Update usage
+        update_user_usage(user_id, file_size)
+        
+        # Clean up
+        try:
+            os.remove(temp_path)
+        except:
+            pass
+        
+        # Delete prompt messages before cleaning up the session
+        if 'media_info_msg' in user_sessions.get(user_id, {}):
+            try:
+                await user_sessions[user_id]['media_info_msg'].delete()
+            except:
+                pass
+        if 'rename_prompt_msg' in user_sessions.get(user_id, {}):
+            try:
+                await user_sessions[user_id]['rename_prompt_msg'].delete()
+            except:
+                pass
+        
+        del user_sessions[user_id]
+        
+    except Exception as e:
+        error_msg = f"❌ <b>Error:</b> {str(e)}"
+        if progress_msg:
+            await safe_edit(progress_msg, error_msg, parse_mode='html')
+        else:
+            await event.reply(error_msg, parse_mode='html')
+        
+        # Clean up on error
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+        # Delete prompt messages even on error
+        if user_id in user_sessions:
+            if 'media_info_msg' in user_sessions[user_id]:
+                try:
+                    await user_sessions[user_id]['media_info_msg'].delete()
+                except:
+                    pass
+            if 'rename_prompt_msg' in user_sessions[user_id]:
+                try:
+                    await user_sessions[user_id]['rename_prompt_msg'].delete()
+                except:
+                    pass
+            del user_sessions[user_id]
+
 def main():
-    """Fonction principale modifiée"""
+    """Main function modified"""
     print("🤖 Bot started successfully!")
     print("📁 Temp directory: {}".format(TEMP_DIR))
     print("📊 Max file size: {}".format(human_readable_size(MAX_FILE_SIZE)))
@@ -1507,12 +1756,12 @@ def main():
     print("⚡ Fast thumbnail mode: ENABLED")
     print(f"📢 Force Join Channel: @{FORCE_JOIN_CHANNEL}")
     
-    # Charger les données
+    # Load data
     load_user_usage()
     load_user_preferences()
     print("📊 User data loaded")
     
-    # Envoyer un message aux admins si configuré
+    # Send a message to admins if configured
     async def notify_admins():
         if ADMIN_IDS:
             admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()]
@@ -1531,15 +1780,15 @@ def main():
                 except:
                     pass
     
-    # Démarrer la tâche de nettoyage automatique
+    # Start automatic cleanup task
     async def start_cleanup():
         await auto_cleanup_task()
     
-    # Notifier les admins et démarrer le nettoyage
+    # Notify admins and start cleanup
     bot.loop.run_until_complete(notify_admins())
     bot.loop.create_task(start_cleanup())
     
-    # Démarrer le bot
+    # Start the bot
     print("\n✅ Bot is running! Press Ctrl+C to stop.\n")
     bot.run_until_disconnected()
 

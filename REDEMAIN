@@ -1,0 +1,62 @@
+welcome_text = """👋 <b>Welcome to Advanced File Rename Bot!</b>
+
+Send me any file and I'll help you rename it.
+
+<b>📋 Features:</b>
+• Support all file types (up to 2 GB)
+• Custom text/username addition
+• Fast thumbnail processing ⚡
+• Auto-cleanup of @tags and #hashtags
+• Video streaming support 🎬"""
+    
+    if custom_text:
+        welcome_text += f"\n• Custom text: <code>{custom_text}</code>"
+    
+    welcome_text += f"""
+
+<b>📊 Your Daily Usage:</b>
+• Used: {human_readable_size(usage_info['daily_used'])} / {human_readable_size(usage_info['daily_limit'])} ({usage_info['percentage']:.1f}%)
+• Remaining: {human_readable_size(usage_info['daily_remaining'])}
+• Cooldown: 30 seconds between files
+
+<b>🎯 Commands:</b>
+/start - Show this message
+/settings - Configure bot settings ⚙️
+/usage - Check your usage limits
+/setthumb - Set custom thumbnail
+/delthumb - Delete custom thumbnail
+/cancel - Cancel current operation
+
+<b>📤 Just send me a file to get started!</b>"""                                                                     
+
+
+
+
+welcome_text = """👋 <b>Welcome to Advanced File Rename Bot!</b>
+
+🔗 <b>Join our channels:</b>
+👉 <a href="https://t.me/Manga206">@Manga206</a> &nbsp; | &nbsp; <a href="https://t.me/THEBESTMANHWA06">@THEBESTMANHWA06</a>
+
+Send me any file and I'll help you rename it.
+
+📋 <b>Features:</b>
+• Support all file types (up to 2 GB)
+• Custom text/username addition
+• Fast thumbnail processing ⚡️
+• Auto-cleanup of @tags and #hashtags
+• Video streaming support 🎬
+
+📊 <b>Your Daily Usage:</b>
+• Used: 0B / 1.0 GB (0.0%)
+• Remaining: 1.0 GB
+• Cooldown: 30 seconds between files
+
+🎯 <b>Commands:</b>
+/start - Show this message
+/settings - Configure bot settings ⚙️
+/usage - Check your usage limits
+/setthumb - Set custom thumbnail
+/delthumb - Delete custom thumbnail
+/cancel - Cancel current operation
+
+📤 <b>Just send me a file to get started!</b>"""
