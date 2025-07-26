@@ -34,7 +34,7 @@ def get_env_or_config(attr, default=None):
 
 API_ID = get_env_or_config("API_ID")
 API_HASH = get_env_or_config("API_HASH")
-BOT_TOKEN = get_env_or_config("BOT_TOKEN")
+TOKEN = get_env_or_config("BOT_TOKEN")
 ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
 
 
