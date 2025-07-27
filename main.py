@@ -1163,14 +1163,13 @@ Send /cancel to abort."""
     elif data.startswith('rename_only_'):
         clicked_user_id = int(data.split('_')[2])
         if clicked_user_id == user_id and user_id in user_sessions:
-            user_sessions[user_id]['action'] = 'rename_only'
+            user_sessions[user_id]['action'] = 'rename_caption_only'
             ask_msg = await event.edit(
-                "✏️ **Please send me the new filename** (including extension).",
+                "✏️ **Please send me the new caption (filename, sans extension si tu veux juste changer le titre)**",
                 buttons=Button.inline("❌ Cancel", f"cancel_{user_id}")
             )
-            # Store message ID AND message object
             user_sessions[user_id]['reply_id'] = ask_msg.id
-            user_sessions[user_id]['rename_prompt_msg'] = ask_msg  # NEW
+            user_sessions[user_id]['rename_prompt_msg'] = ask_msg
         else:
             await event.answer("❌ This is not for you or the session has expired.", alert=True)
 
@@ -1246,6 +1245,33 @@ async def text_handler(event):
             f"This will be added to all renamed files.",
             parse_mode='html'
         )
+        return
+
+@bot.on(events.NewMessage(func=lambda e: e.is_reply))
+async def rename_caption_handler(event):
+    user_id = event.sender_id
+
+    if user_id in user_sessions and user_sessions[user_id].get('action') == 'rename_caption_only':
+        reply_to = await event.get_reply_message()
+        if reply_to.id != user_sessions[user_id]['reply_id']:
+            return
+
+        new_caption = event.text.strip()
+        original_msg = user_sessions[user_id]['message']
+
+        # Edit caption du fichier déjà uploadé sur Telegram
+        try:
+            await original_msg.edit(new_caption)
+            await event.reply("✅ Caption updated! (filename changed visuellement, pas le vrai fichier)")
+        except Exception as e:
+            await event.reply(f"❌ Error: {e}")
+        finally:
+            # Nettoyage
+            if 'rename_prompt_msg' in user_sessions[user_id]:
+                try:
+                    await user_sessions[user_id]['rename_prompt_msg'].delete()
+                except: pass
+            del user_sessions[user_id]
         return
 
 @bot.on(events.NewMessage(func=lambda e: e.is_reply))
