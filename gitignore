@@ -1,0 +1,8 @@
+# 🔒 Fichiers à ignorer
+config.py
+rename_bot.session
+downloads/
+thumbnails/
+user_preferences.json
+user_usage.json
+git
