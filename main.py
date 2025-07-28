@@ -27,15 +27,21 @@ def get_env_or_config(attr, default=None):
             return int(value)
         return value
     try:
-        from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS
+        from config import API_ID, API_HASH, TOKEN, ADMIN_IDS
         return locals()[attr]
     except Exception:
         return default
 
 API_ID = get_env_or_config("API_ID")
 API_HASH = get_env_or_config("API_HASH")
-TOKEN = get_env_or_config("BOT_TOKEN")
+TOKEN = get_env_or_config("TOKEN")
 ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
+
+# Debug: Print loaded values (remove in production)
+print(f"API_ID: {API_ID}")
+print(f"API_HASH: {API_HASH}")
+print(f"TOKEN: {TOKEN[:20] if TOKEN else 'None'}...")
+print(f"ADMIN_IDS: {ADMIN_IDS}")
 
 
 async def safe_edit(msg_obj, new_text, **kwargs):
@@ -416,6 +422,8 @@ def sanitize_filename(filename):
         name = name[:200]
     return name + ext
 
+
+
 def get_video_duration(file_path):
     """Gets the duration of a video with ffprobe"""
     try:
@@ -467,6 +475,93 @@ def get_video_dimensions(file_path):
     except:
         pass
     return None, None
+
+def get_video_attributes(file_path, sanitized_name):
+    """Crée les attributs vidéo optimisés pour le streaming"""
+    duration = get_video_duration(file_path)
+    width, height = get_video_dimensions(file_path)
+    
+    # Valeurs par défaut si on ne peut pas les obtenir
+    if not width or not height:
+        width, height = 1280, 720  # HD par défaut
+    if not duration:
+        duration = 0
+    
+    attributes = [
+        DocumentAttributeFilename(sanitized_name),
+        DocumentAttributeVideo(
+            duration=duration,
+            w=width,
+            h=height,
+            supports_streaming=True,  # ✅ CRUCIAL !
+            round_message=False
+        )
+    ]
+    
+    return attributes
+
+async def ensure_video_compatibility(file_path, progress_msg=None):
+    """Vérifie et convertit si nécessaire la vidéo pour la compatibilité Telegram"""
+    
+    # Vérifier le codec avec ffprobe
+    if not shutil.which("ffprobe"):
+        return file_path  # Pas de ffprobe, on garde le fichier tel quel
+    
+    try:
+        import subprocess
+        import json
+        
+        # Obtenir les infos du codec
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            streams = data.get('streams', [])
+            
+            video_codec = None
+            audio_codec = None
+            
+            for stream in streams:
+                if stream['codec_type'] == 'video':
+                    video_codec = stream.get('codec_name', '')
+                elif stream['codec_type'] == 'audio':
+                    audio_codec = stream.get('codec_name', '')
+            
+            # Si déjà en H264/AAC, pas besoin de convertir
+            if video_codec == 'h264' and audio_codec == 'aac':
+                return file_path
+            
+            # Sinon, convertir
+            if progress_msg:
+                await safe_edit(progress_msg, "🔄 <b>Converting video for better compatibility...</b>", parse_mode='html')
+            
+            output_path = file_path.replace('.', '_converted.')
+            
+            # Commande FFmpeg optimisée pour Telegram
+            cmd = [
+                'ffmpeg', '-i', file_path,
+                '-c:v', 'libx264',           # Codec vidéo H.264
+                '-c:a', 'aac',               # Codec audio AAC
+                '-preset', 'fast',           # Conversion rapide
+                '-movflags', '+faststart',   # ✅ CRUCIAL pour le streaming !
+                '-y',                        # Écraser si existe
+                output_path
+            ]
+            
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            # Supprimer l'original et retourner le converti
+            os.remove(file_path)
+            return output_path
+            
+    except Exception as e:
+        logging.warning(f"Video conversion failed: {e}")
+        return file_path  # En cas d'erreur, garder l'original
 
 async def progress_callback(current, total, event, start_time, progress_msg, action="Downloading", last_update_time=None):
     """Callback to display progress"""
@@ -797,15 +892,28 @@ async def setthumb_handler(event):
         'timestamp': datetime.now()
     }
     
-    await event.reply(
-        "🖼️ <b>Send me a photo to set as thumbnail</b>\n\n"
-        "Requirements:\n"
-        "• Must be a photo (not document)\n"
-        "• Size limit: 200 KB\n"
-        "• Format: JPEG/PNG\n\n"
-        "Send /cancel to abort.",
-        parse_mode='html'
-    )
+    # Check if user already has a thumbnail
+    existing_thumb = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
+    has_existing = os.path.exists(existing_thumb)
+    
+    message = "🖼️ <b>Send me a photo to set as thumbnail</b>\n\n"
+    
+    if has_existing:
+        message += "⚠️ <b>Note:</b> You already have a thumbnail. The new one will replace it.\n\n"
+    
+    message += """Requirements:
+- Must be a photo (not document)
+- Size limit: 200 KB
+- Format: JPEG/PNG
+
+💡 <b>Tips for video thumbnails:</b>
+- Use 16:9 aspect ratio for best results
+- Bright, clear images work better
+- Avoid text-heavy thumbnails
+
+Send /cancel to abort."""
+    
+    await event.reply(message, parse_mode='html')
 
 @bot.on(events.NewMessage(pattern='/delthumb'))
 async def delthumb_handler(event):
@@ -952,15 +1060,26 @@ async def file_handler(event):
         'timestamp': datetime.now(),
         'action': None,
         'is_video': is_video,
-        'file_size': file.size  # Store size for usage update
+        'file_size': file.size,  # Store size for usage update
+        'current_caption': event.message.message if event.message.message else 'None'  # Store current caption
     }
     
-    # Create buttons
-    buttons = [
-        [Button.inline("🖼️ Add Thumbnail", f"add_thumb_{user_id}")],
-        [Button.inline("✏️ Rename Only", f"rename_only_{user_id}")],
-        [Button.inline("❌ Cancel", f"cancel_{user_id}")]
-    ]
+    # Check if thumbnail exists
+    thumb_path = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
+    has_thumbnail = os.path.exists(thumb_path)
+    
+
+    
+    # Create buttons based on context
+    buttons = []
+    
+    if has_thumbnail:
+        buttons.append([Button.inline("🖼️ Add Thumbnail", f"add_thumb_{user_id}")])
+    else:
+        buttons.append([Button.inline("🖼️ Set Thumbnail First", f"no_thumb_{user_id}")])
+    
+    buttons.append([Button.inline("✏️ Rename Only", f"rename_only_{user_id}")])
+    buttons.append([Button.inline("❌ Cancel", f"cancel_{user_id}")])
     
     # Get usage information for display
     usage_info = get_user_usage_info(user_id)
@@ -970,16 +1089,26 @@ async def file_handler(event):
 ◆ <b>Name:</b> <code>{}</code>
 ◆ <b>Size:</b> {}
 ◆ <b>Type:</b> {} {}
-◆ <b>Extension:</b> {}
-
-📊 <b>Your Usage:</b> {} / {} ({:.1f}%)
-
-❓ <b>What do you want to do?</b>""".format(
+◆ <b>Extension:</b> {}""".format(
         file_name,
         file_size,
         mime_type,
         "🎬 (Video)" if is_video else "",
-        extension,
+        extension
+    )
+    
+    if has_thumbnail:
+        info_text += "\n◆ <b>Thumbnail:</b> ✅ Set"
+    else:
+        info_text += "\n◆ <b>Thumbnail:</b> ❌ Not set (use /setthumb)"
+    
+
+    
+    info_text += """
+
+📊 <b>Your Usage:</b> {} / {} ({:.1f}%)
+
+❓ <b>What do you want to do?</b>""".format(
         human_readable_size(usage_info['daily_used']),
         human_readable_size(usage_info['daily_limit']),
         usage_info['percentage']
@@ -1109,19 +1238,11 @@ Send /cancel to abort."""
         await event.edit(message, parse_mode='html')
         return
     
-    if data.startswith('cancel_'):
-        clicked_user_id = int(data.split('_')[1])
-        if clicked_user_id == user_id and user_id in user_sessions:
-            if 'temp_path' in user_sessions[user_id]:
-                try:
-                    os.remove(user_sessions[user_id]['temp_path'])
-                except:
-                    pass
-            del user_sessions[user_id]
-            await event.edit("❌ <b>Operation cancelled.</b>", parse_mode='html')
-        else:
-            await event.answer("❌ You can't cancel this operation.", alert=True)
-
+    # Nouveau : Gestion du "pas de miniature"
+    if data.startswith('no_thumb_'):
+        await event.answer("❌ Please set a thumbnail first with /setthumb", alert=True)
+        return
+    
     elif data.startswith('add_thumb_'):
         clicked_user_id = int(data.split('_')[2])
         if clicked_user_id == user_id and user_id in user_sessions:
@@ -1153,25 +1274,46 @@ Send /cancel to abort."""
             # Store action
             user_sessions[user_id]['action'] = 'add_thumbnail_rename'
             
-            # Send message and store ID AND message object
+            # Send message and store ID
             ask_msg = await event.edit(info_card, parse_mode='html')
             user_sessions[user_id]['reply_id'] = ask_msg.id
-            user_sessions[user_id]['media_info_msg'] = ask_msg  # NEW: store message object
+            user_sessions[user_id]['media_info_msg'] = ask_msg
         else:
             await event.answer("❌ This is not for you or session expired.", alert=True)
+
+    if data.startswith('cancel_'):
+        clicked_user_id = int(data.split('_')[1])
+        if clicked_user_id == user_id and user_id in user_sessions:
+            if 'temp_path' in user_sessions[user_id]:
+                try:
+                    os.remove(user_sessions[user_id]['temp_path'])
+                except:
+                    pass
+            del user_sessions[user_id]
+            await event.edit("❌ <b>Operation cancelled.</b>", parse_mode='html')
+        else:
+            await event.answer("❌ You can't cancel this operation.", alert=True)
             
     elif data.startswith('rename_only_'):
         clicked_user_id = int(data.split('_')[2])
         if clicked_user_id == user_id and user_id in user_sessions:
             user_sessions[user_id]['action'] = 'rename_caption_only'
+            # On stocke le file_id du fichier Telegram à réutiliser
+            original_msg = user_sessions[user_id]['message']
+            user_sessions[user_id]['file_id'] = original_msg.file.id
+            user_sessions[user_id]['is_video'] = user_sessions[user_id].get('is_video', False)
             ask_msg = await event.edit(
-                "✏️ **Please send me the new caption (filename, sans extension si tu veux juste changer le titre)**",
+                "✏️ <b>Send me the new caption for this file :</b>\n\n"
+                "Le nom du fichier ne changera pas, seule la description sera modifiée.",
+                parse_mode='html',
                 buttons=Button.inline("❌ Cancel", f"cancel_{user_id}")
             )
             user_sessions[user_id]['reply_id'] = ask_msg.id
             user_sessions[user_id]['rename_prompt_msg'] = ask_msg
         else:
-            await event.answer("❌ This is not for you or the session has expired.", alert=True)
+            await event.answer("❌ Ce n'est pas pour toi ou la session a expiré.", alert=True)
+
+
 
     elif data == 'help':
         # Detailed help message
@@ -1248,33 +1390,6 @@ async def text_handler(event):
         return
 
 @bot.on(events.NewMessage(func=lambda e: e.is_reply))
-async def rename_caption_handler(event):
-    user_id = event.sender_id
-
-    if user_id in user_sessions and user_sessions[user_id].get('action') == 'rename_caption_only':
-        reply_to = await event.get_reply_message()
-        if reply_to.id != user_sessions[user_id]['reply_id']:
-            return
-
-        new_caption = event.text.strip()
-        original_msg = user_sessions[user_id]['message']
-
-        # Edit caption du fichier déjà uploadé sur Telegram
-        try:
-            await original_msg.edit(new_caption)
-            await event.reply("✅ Caption updated! (filename changed visuellement, pas le vrai fichier)")
-        except Exception as e:
-            await event.reply(f"❌ Error: {e}")
-        finally:
-            # Nettoyage
-            if 'rename_prompt_msg' in user_sessions[user_id]:
-                try:
-                    await user_sessions[user_id]['rename_prompt_msg'].delete()
-                except: pass
-            del user_sessions[user_id]
-        return
-
-@bot.on(events.NewMessage(func=lambda e: e.is_reply))
 async def rename_handler(event):
     """Improved handler for renaming files"""
     user_id = event.sender_id
@@ -1284,7 +1399,7 @@ async def rename_handler(event):
         return
     
     action = user_sessions[user_id].get('action')
-    if action not in ['rename_only', 'add_thumbnail_rename']:
+    if action not in ['rename_only', 'add_thumbnail_rename', 'rename_caption_only']:
         return
     
     # Clean up old sessions
@@ -1317,8 +1432,58 @@ async def rename_handler(event):
     
     # Process based on action
     try:
-        if action == 'rename_only':
-            await fast_rename_only(event, user_id, new_name)
+        if action == 'rename_caption_only':
+            # Changer seulement la caption (comme "Edit Name" du bot PDF)
+            file_id = user_sessions[user_id].get('file_id')
+            is_video = user_sessions[user_id].get('is_video', False)
+            original_file_name = user_sessions[user_id].get('file_name')
+
+            new_caption = event.text.strip()
+            # Nettoyage éventuel (tags, usernames, etc.)
+            if sessions.get(user_id, {}).get('clean_tags', True):
+                new_caption = clean_filename_text(new_caption)
+            custom_text = sessions.get(user_id, {}).get('custom_text', '')
+            if custom_text and not custom_text in new_caption:
+                new_caption += f" {custom_text}"
+
+            # Ré-envoi du fichier via file_id avec la nouvelle caption
+            try:
+                if is_video:
+                    await event.client.send_file(
+                        event.chat_id,
+                        file=file_id,
+                        caption=new_caption,
+                        force_document=True,  # ou False si tu veux l'envoyer comme "video"
+                        parse_mode='html',
+                        file_name=original_file_name,
+                        supports_streaming=True,
+                        allow_cache=False
+                    )
+                else:
+                    await event.client.send_file(
+                        event.chat_id,
+                        file=file_id,
+                        caption=new_caption,
+                        force_document=True,
+                        parse_mode='html',
+                        file_name=original_file_name,
+                        allow_cache=False
+                    )
+                # Message de succès
+                await event.reply("✅ Caption updated! (File name unchanged.)")
+            except Exception as e:
+                await event.reply(f"❌ Error: {str(e)}")
+
+            # Clean up (supprimer les prompts si besoin)
+            if 'rename_prompt_msg' in user_sessions[user_id]:
+                try:
+                    await user_sessions[user_id]['rename_prompt_msg'].delete()
+                except:
+                    pass
+            del user_sessions[user_id]
+            return  # Fin du handler
+            
+
         elif action == 'add_thumbnail_rename':
             await process_with_thumbnail(event, user_id, new_name)
         
@@ -1404,20 +1569,13 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
         
         upload_path = temp_path
         
-        # Get video attributes if it's a video
-        video_attributes = []
+        # Vérifier/convertir pour compatibilité si c'est une vidéo
         if is_video:
-            duration = get_video_duration(temp_path)
-            width, height = get_video_dimensions(temp_path)
-            
-            if duration or (width and height):
-                video_attr = DocumentAttributeVideo(
-                    duration=duration or 0,
-                    w=width or 0,
-                    h=height or 0,
-                    supports_streaming=True
-                )
-                video_attributes.append(video_attr)
+            temp_path = await ensure_video_compatibility(temp_path, progress_msg)
+            # Créer les attributs optimisés
+            video_attributes = get_video_attributes(temp_path, sanitized_name)
+        else:
+            video_attributes = []
         
         # SKIP FFmpeg - not necessary for simple renaming
         # Optimization disabled to improve performance
@@ -1454,11 +1612,12 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
             parse_mode='html',
             file_name=sanitized_name,
             thumb=thumb_to_use,
-            supports_streaming=False,  # Force name display
-            force_document=True,       # Force sending as document
+            supports_streaming=True,  # ✅ Toujours True pour les vidéos
+            force_document=True,      # ✅ Toujours True pour forcer le mode document
             attributes=file_attributes,
             progress_callback=upload_progress,
-            part_size_kb=512  # Optimized chunks for better performance
+            part_size_kb=512,  # Optimized chunks for better performance
+            allow_cache=False  # ✅ Force Telegram à régénérer les previews
         )
         
         await progress_msg.delete()
@@ -1497,126 +1656,9 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
         if user_id in user_sessions:
             del user_sessions[user_id]
 
-async def fast_rename_only(event, user_id, new_name):
-    """Ultra-fast file rename without re-upload or thumbnail logic."""
-    if user_id not in user_sessions:
-        return
 
-    progress_msg = None
-    try:
-        # Clean up name
-        sanitized_name = sanitize_filename(new_name)
-        # Keep original extension if missing
-        original_filename = user_sessions[user_id]['file_name']
-        file_extension = os.path.splitext(original_filename)[1]
-        if not sanitized_name.endswith(file_extension):
-            sanitized_name += file_extension
 
-        # Progress message
-        progress_msg = await event.reply("⚡ <b>Renaming in progress...</b>", parse_mode='html')
 
-        original_msg = user_sessions[user_id]['message']
-        is_video = user_sessions[user_id].get('is_video', False)
-
-        # Generate unique local path per user and file id
-        file_id = original_msg.file.id
-        local_path = get_local_file_path(user_id, file_id, file_extension)
-
-        # Check if already in cache, otherwise download only once
-        if os.path.exists(local_path):
-            await safe_edit(progress_msg, "🚀 <b>File found locally!</b> No download needed.", parse_mode='html')
-        else:
-            await safe_edit(progress_msg, "📥 <b>Downloading file (1st time)...</b>", parse_mode='html')
-            downloaded_path = await original_msg.download_media(file=local_path)
-            if not downloaded_path or not os.path.exists(downloaded_path):
-                raise Exception("Failed to download file")
-            if downloaded_path != local_path:
-                shutil.move(downloaded_path, local_path)
-
-        # Create a renamed temporary copy
-        temp_renamed_path = os.path.join(TEMP_DIR, f"{user_id}_{int(time.time())}_{sanitized_name}")
-        shutil.copy2(local_path, temp_renamed_path)
-
-        # File attributes (name)
-        file_attributes = [DocumentAttributeFilename(sanitized_name)]
-        # Video attribute if needed
-        if is_video:
-            duration = get_video_duration(temp_renamed_path)
-            width, height = get_video_dimensions(temp_renamed_path)
-            if duration or (width and height):
-                video_attr = DocumentAttributeVideo(
-                    duration=duration or 0,
-                    w=width or 0,
-                    h=height or 0,
-                    supports_streaming=True
-                )
-                file_attributes.append(video_attr)
-
-        # Caption
-        caption = f"<code>{sanitized_name}</code>"
-
-        await safe_edit(progress_msg, "📤 <b>Sending renamed file...</b>", parse_mode='html')
-
-        await event.client.send_file(
-            event.chat_id,
-            temp_renamed_path,
-            caption=caption,
-            parse_mode='html',
-            file_name=sanitized_name,
-            supports_streaming=is_video,
-            force_document=not is_video,
-            attributes=file_attributes
-        )
-        await progress_msg.delete()
-
-        # Update usage if tracking is enabled
-        if 'file_size' in user_sessions[user_id]:
-            update_user_usage(user_id, user_sessions[user_id]['file_size'])
-
-        try:
-            os.remove(temp_renamed_path)
-        except:
-            pass
-
-        # Delete prompt messages before cleaning up the session
-        if 'media_info_msg' in user_sessions.get(user_id, {}):
-            try:
-                await user_sessions[user_id]['media_info_msg'].delete()
-            except:
-                pass
-        if 'rename_prompt_msg' in user_sessions.get(user_id, {}):
-            try:
-                await user_sessions[user_id]['rename_prompt_msg'].delete()
-            except:
-                pass
-        
-        del user_sessions[user_id]
-
-    except Exception as e:
-        error_msg = f"❌ <b>Error:</b> {str(e)}"
-        if progress_msg:
-            await safe_edit(progress_msg, error_msg, parse_mode='html')
-        else:
-            await event.reply(error_msg, parse_mode='html')
-        if 'temp_renamed_path' in locals() and os.path.exists(temp_renamed_path):
-            try:
-                os.remove(temp_renamed_path)
-            except:
-                pass
-        
-        # Delete prompt messages even on error
-        if user_id in user_sessions:
-            if 'media_info_msg' in user_sessions[user_id]:
-                try:
-                    await user_sessions[user_id]['media_info_msg'].delete()
-                except:
-                    pass
-            if 'rename_prompt_msg' in user_sessions[user_id]:
-                try:
-                    await user_sessions[user_id]['rename_prompt_msg'].delete()
-                except:
-                    pass
-            del user_sessions[user_id]
 
 async def process_with_thumbnail(event, user_id, new_name):
     """Processes the file with thumbnail and new name"""
@@ -1684,21 +1726,13 @@ async def process_with_thumbnail(event, user_id, new_name):
         # Get the thumbnail
         thumb_path = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
         
-        # Prepare attributes
-        file_attributes = [DocumentAttributeFilename(sanitized_name)]
-        
+        # Vérifier/convertir pour compatibilité si c'est une vidéo
         if is_video:
-            duration = get_video_duration(temp_path)
-            width, height = get_video_dimensions(temp_path)
-            
-            if duration or (width and height):
-                video_attr = DocumentAttributeVideo(
-                    duration=duration or 0,
-                    w=width or 0,
-                    h=height or 0,
-                    supports_streaming=True
-                )
-                file_attributes.append(video_attr)
+            temp_path = await ensure_video_compatibility(temp_path, progress_msg)
+            # Créer les attributs optimisés
+            file_attributes = get_video_attributes(temp_path, sanitized_name)
+        else:
+            file_attributes = [DocumentAttributeFilename(sanitized_name)]
         
         # Minimal caption (just the name like rename_only)
         caption = f"<code>{sanitized_name}</code>"
@@ -1713,9 +1747,10 @@ async def process_with_thumbnail(event, user_id, new_name):
             parse_mode='html',
             file_name=sanitized_name,
             thumb=thumb_path,
-            supports_streaming=is_video,
-            force_document=not is_video,
-            attributes=file_attributes
+            supports_streaming=True,  # ✅ Toujours True
+            force_document=True,      # ✅ Toujours True
+            attributes=file_attributes,
+            allow_cache=False         # ✅ Force Telegram à régénérer les previews
         )
         
         await progress_msg.delete()
