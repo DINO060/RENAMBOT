@@ -40,11 +40,7 @@ TOKEN = get_env_or_config("TOKEN")
 ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
 START_TIME = datetime.now(timezone.utc)
 
-# Debug: Print loaded values (remove in production)
-print(f"API_ID: {API_ID}")
-print(f"API_HASH: {API_HASH}")
-print(f"TOKEN: {TOKEN[:20] if TOKEN else 'None'}...")
-print(f"ADMIN_IDS: {ADMIN_IDS}")
+
 
 
 async def safe_edit(msg_obj, new_text, **kwargs):
@@ -73,11 +69,7 @@ async def safe_edit(msg_obj, new_text, **kwargs):
             # Re-raise other errors
             raise
 
-# Import configuration
-#bAPI_ID = int(os.getenv("API_ID"))
-#API_HASH = os.getenv("API_HASH")
-#TOKEN = os.getenv("TOKEN")
-#ADMIN_IDS = os.getenv("ADMIN_IDS")
+
 
 # 🔥 FORCE JOIN CHANNEL CONFIGURATION 🔥 (legacy single channel kept as fallback)
 FORCE_JOIN_CHANNEL = "djd208"  # fallback if no channels configured in JSON
