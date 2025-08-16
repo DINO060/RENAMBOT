@@ -944,9 +944,17 @@ Send me any file and I'll help you rename it.
 /start - Show this message
 /settings - Configure bot settings ⚙️
 /usage - Check your usage limits
+/status - Show bot status 📊
 /setthumb - Set custom thumbnail
 /delthumb - Delete custom thumbnail
+/showthumb - Show current thumbnail
 /cancel - Cancel current operation
+/cleanup - Clean temporary files 🧹
+
+<b>🔧 Admin Commands:</b>
+/channels - Show force join channels
+/addfsub - Add force join channel
+/delfsub - Remove force join channel
 
 <b>📤 Just send me a file to get started!</b>"""
     
@@ -2107,31 +2115,54 @@ def main():
     load_user_preferences()
     print("📊 User data loaded")
     
-    # Send a message to admins if configured
-    async def notify_admins():
+    # Send a message to all users who have interacted with the bot
+    async def notify_all_users():
+        # Get all user IDs from usage data
+        all_users = list(user_usage.keys())
+        
+        # Add admin IDs if configured
         if ADMIN_IDS:
             admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()]
             for admin_id in admin_list:
-                try:
-                    await bot.send_message(
-                        admin_id, 
-                        f"🟢 <b>Bot started!</b>\n\n"
-                        f"Rename bot is now online and ready.\n\n"
-                        f"📈 Daily limit: {human_readable_size(DAILY_LIMIT_BYTES)}\n"
-                        f"⏱ Cooldown: {COOLDOWN_SECONDS}s\n"
-                        f"⚡ Fast mode: ENABLED\n"
-                        f"📢 Force Join: @{FORCE_JOIN_CHANNEL}",
-                        parse_mode='html'
-                    )
-                except:
-                    pass
+                if admin_id not in all_users:
+                    all_users.append(admin_id)
+        
+        # Remove duplicates
+        all_users = list(set(all_users))
+        
+        # Send startup message to all users
+        startup_message = (
+            f"🟢 <b>Bot started!</b>\n\n"
+            f"Rename bot is now online and ready.\n\n"
+            f"📈 Daily limit: {human_readable_size(DAILY_LIMIT_BYTES)}\n"
+            f"⏱ Cooldown: {COOLDOWN_SECONDS}s\n"
+            f"⚡ Fast mode: ENABLED\n"
+            f"📢 Force Join: @{FORCE_JOIN_CHANNEL}"
+        )
+        
+        success_count = 0
+        for user_id in all_users:
+            try:
+                await bot.send_message(
+                    user_id, 
+                    startup_message,
+                    parse_mode='html'
+                )
+                success_count += 1
+                # Small delay to avoid flood
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logging.error(f"Failed to send startup message to user {user_id}: {e}")
+                continue
+        
+        print(f"📢 Startup message sent to {success_count}/{len(all_users)} users")
     
     # Start automatic cleanup task
     async def start_cleanup():
         await auto_cleanup_task()
     
-    # Notify admins and start cleanup
-    bot.loop.run_until_complete(notify_admins())
+    # Notify all users and start cleanup
+    bot.loop.run_until_complete(notify_all_users())
     bot.loop.create_task(start_cleanup())
     
     # Start the bot
