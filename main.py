@@ -4,12 +4,14 @@
 import asyncio
 import os
 import time
+from time import perf_counter
 import math
 import re
 import uuid
 import shutil
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from collections import defaultdict
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
@@ -36,6 +38,7 @@ API_ID = get_env_or_config("API_ID")
 API_HASH = get_env_or_config("API_HASH")
 TOKEN = get_env_or_config("TOKEN")
 ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
+START_TIME = datetime.now(timezone.utc)
 
 # Debug: Print loaded values (remove in production)
 print(f"API_ID: {API_ID}")
@@ -76,8 +79,124 @@ async def safe_edit(msg_obj, new_text, **kwargs):
 #TOKEN = os.getenv("TOKEN")
 #ADMIN_IDS = os.getenv("ADMIN_IDS")
 
-# 🔥 FORCE JOIN CHANNEL CONFIGURATION 🔥
-FORCE_JOIN_CHANNEL = "djd208"  # ⚠️ REPLACE WITH YOUR CHANNEL (without @)
+# 🔥 FORCE JOIN CHANNEL CONFIGURATION 🔥 (legacy single channel kept as fallback)
+FORCE_JOIN_CHANNEL = "djd208"  # fallback if no channels configured in JSON
+
+# --- Admin parsing & force-join JSON (multi-channel) ---
+def _parse_admin_ids(s: str):
+    ids = set()
+    for x in str(s or "").replace(" ", "").split(","):
+        if not x:
+            continue
+        try:
+            ids.add(int(x))
+        except Exception:
+            pass
+    return ids
+
+ADMIN_SET = _parse_admin_ids(ADMIN_IDS)
+BASE_DIR = Path(__file__).resolve().parent
+FJ_PATH = BASE_DIR / "force_join_channels.json"
+fj_lock = asyncio.Lock()
+
+def _ensure_fj_file():
+    if not FJ_PATH.exists():
+        FJ_PATH.write_text(json.dumps({"channels": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _normalize_channel(ref: str) -> str:
+    ref = (ref or "").strip()
+    if not ref:
+        return ref
+    if ref.startswith("@"):  # username
+        return ref
+    try:
+        int(ref)  # allow -100...
+        return ref
+    except Exception:
+        if "t.me/" in ref:
+            tail = ref.split("t.me/", 1)[1].strip().strip("/")
+            if tail and not tail.startswith("@"):  
+                tail = "@" + tail
+            return tail
+        return ref if ref.startswith("@") else ("@" + ref)
+
+async def load_fj_channels() -> list:
+    _ensure_fj_file()
+    try:
+        data = json.loads(FJ_PATH.read_text(encoding="utf-8"))
+        ch = data.get("channels", [])
+        uniq, seen = [], set()
+        for c in ch:
+            nc = _normalize_channel(str(c))
+            if nc and nc not in seen:
+                seen.add(nc)
+                uniq.append(nc)
+        return uniq
+    except Exception:
+        return []
+
+async def save_fj_channels(channels: list) -> None:
+    _ensure_fj_file()
+    FJ_PATH.write_text(json.dumps({"channels": channels}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def get_forced_channels() -> list:
+    """Get list of forced channels"""
+    data = _load_json(FJ_PATH, {"channels": []})
+    chans = []
+    for ch in data.get("channels", []):
+        c = str(ch).strip().lstrip("@").lstrip("#")
+        if c and c not in chans:
+            chans.append(c)
+    data["channels"] = chans
+    _save_json(FJ_PATH, data)
+    return chans
+
+def set_forced_channels(channels: list):
+    """Set forced channels list"""
+    norm = []
+    for ch in channels:
+        c = str(ch).strip().lstrip("@").lstrip("#")
+        if c and c not in norm:
+            norm.append(c)
+    _save_json(FJ_PATH, {"channels": norm})
+
+def add_forced_channels(channels: list) -> list:
+    """Add channels to forced list"""
+    current = set(get_forced_channels())
+    for ch in channels:
+        c = str(ch).strip().lstrip("@").lstrip("#")
+        if c:
+            current.add(c)
+    set_forced_channels(list(current))
+    return get_forced_channels()
+
+def del_forced_channels(channels: list) -> list:
+    """Remove channels from forced list"""
+    current = set(get_forced_channels())
+    for ch in channels:
+        c = str(ch).strip().lstrip("@").lstrip("#")
+        if c in current:
+            current.remove(c)
+    set_forced_channels(list(current))
+    return get_forced_channels()
+
+def _load_json(path, default):
+    """Load JSON file"""
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+def _save_json(path, data):
+    """Save JSON file"""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"Error saving {path.name}: {e}")
 
 # Configuration
 MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB
@@ -104,6 +223,40 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)  # New directory
 
+# Initialize the Telethon client
+bot = TelegramClient('rename_bot', API_ID, API_HASH).start(bot_token=TOKEN)
+
+# Rename stats (JSON local)
+RENAME_STATS_PATH = os.path.join(os.path.dirname(__file__), 'rename_stats.json')
+_rename_lock = asyncio.Lock()
+
+def _ensure_rename_stats_file():
+    if not os.path.exists(RENAME_STATS_PATH):
+        with open(RENAME_STATS_PATH, 'w', encoding='utf-8') as f:
+            json.dump({"total_files_renamed": 0, "total_storage_bytes": 0}, f, ensure_ascii=False, indent=2)
+
+async def load_rename_stats() -> dict:
+    _ensure_rename_stats_file()
+    try:
+        with open(RENAME_STATS_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {"total_files_renamed": 0, "total_storage_bytes": 0}
+
+async def add_rename_stat(file_size_bytes: int) -> None:
+    _ensure_rename_stats_file()
+    async with _rename_lock:
+        try:
+            with open(RENAME_STATS_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            data = {"total_files_renamed": 0, "total_storage_bytes": 0}
+        data["total_files_renamed"] = int(data.get("total_files_renamed", 0)) + 1
+        inc = int(file_size_bytes or 0)
+        data["total_storage_bytes"] = int(data.get("total_storage_bytes", 0)) + max(0, inc)
+        with open(RENAME_STATS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
 # Dictionary to store user sessions
 user_sessions = {}
 
@@ -123,47 +276,140 @@ def get_local_file_path(user_id, file_id, extension):
     os.makedirs(user_dir, exist_ok=True)
     return os.path.join(user_dir, f"{file_id}{extension}")
 
-# 🔥 FORCE JOIN CHANNEL FUNCTIONS 🔥
-async def is_user_in_channel(user_id):
-    """Checks if the user is a member of the channel"""
-    # Admin exemption
-    admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()] if ADMIN_IDS else []
-    if user_id in admin_list:
-        return True
-    
-    try:
-        await bot(GetParticipantRequest(
-            channel=FORCE_JOIN_CHANNEL,
-            participant=user_id
-        ))
-        return True
-    except UserNotParticipantError:
-        return False
-    except ChannelPrivateError:
-        logging.error(f"Bot doesn't have access to channel {FORCE_JOIN_CHANNEL}")
-        return True  # Let it pass to avoid blocking
-    except Exception as e:
-        logging.error(f"Channel verification error: {e}")
-        return True  # In case of error, let it pass
+# 🔥 FORCE JOIN CHANNEL FUNCTIONS 🔥 (multi-channel)
+async def is_user_in_required_channels(user_id):
+    """Return (ok, missing_list). Admins bypass. If no JSON channels, fallback to FORCE_JOIN_CHANNEL."""
+    if user_id in ADMIN_SET:
+        return True, []
+    channels = get_forced_channels()
+    if not channels:
+        # Fallback to single channel config if set
+        channels = [FORCE_JOIN_CHANNEL] if FORCE_JOIN_CHANNEL else []
+        if not channels:
+            return True, []
+    missing = []
+    for ch in channels:
+        try:
+            await bot(GetParticipantRequest(channel=ch, participant=user_id))
+        except UserNotParticipantError:
+            missing.append(ch)
+        except ChannelPrivateError:
+            logging.error(f"No access to channel {ch}")
+            missing.append(ch)
+        except Exception as e:
+            logging.error(f"Channel verification error for {ch}: {e}")
+            missing.append(ch)
+    return (len(missing) == 0), missing
 
-async def send_force_join_message(event):
-    """Sends the message asking the user to join the channel"""
-    buttons = [
-        [Button.url(f"📢 Join @{FORCE_JOIN_CHANNEL}", f"https://t.me/{FORCE_JOIN_CHANNEL}")],
-        [Button.inline("✅ I have joined", "check_joined")]
-    ]
-    
-    message = f"""🚫 <b>Access Denied!</b>
+async def send_force_join_message(event, missing_channels=None):
+    """Sends the message asking the user to join required channels"""
+    channels = missing_channels or get_forced_channels() or ([FORCE_JOIN_CHANNEL] if FORCE_JOIN_CHANNEL else [])
+    buttons = []
+    for ch in channels:
+        label = ch if str(ch).startswith('@') else f"{ch}"
+        url = f"https://t.me/{label.lstrip('@')}"
+        buttons.append([Button.url(f"📢 Join {label}", url)])
+    buttons.append([Button.inline("✅ I have joined", "check_joined")])
 
-To use this bot, you must first join our official channel:
-👉 @{FORCE_JOIN_CHANNEL}
-
-✅ Click the button below to join.
-Once done, click "I have joined" to continue.
-
-<i>Thank you for your support! 💙</i>"""
-    
+    links = "\n".join(f"• {ch}" for ch in channels)
+    message = (
+        "🚫 <b>Access Denied!</b>\n\n"
+        "To use this bot, you must first join these channels:\n"
+        f"{links}\n\n"
+        "✅ Click the buttons below to join.\n"
+        "Once done, click \"I have joined\" to continue.\n\n"
+        "<i>Thank you for your support! 💙</i>"
+    )
     await event.reply(message, parse_mode='html', buttons=buttons)
+
+
+# --- Admin helpers ---
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_SET
+
+
+def uptime_str() -> str:
+    delta = datetime.now(timezone.utc) - START_TIME
+    d = delta.days
+    h, rem = divmod(delta.seconds, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
+
+
+def format_bytes(num: float) -> str:
+    try:
+        n = float(num or 0)
+    except Exception:
+        n = 0.0
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while n >= 1024 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
+    return f"{n:.2f} {units[i]}"
+
+
+# --- Admin commands: /addfsub /delfsub /channels ---
+@bot.on(events.NewMessage(pattern=r"/addfsub(?:\s+.*)?"))
+async def addfsub_cmd(event):
+    user_id = event.sender_id
+    if not is_admin(user_id):
+        await event.reply("🚫 Admins only.")
+        return
+    text = event.raw_text or event.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await event.reply(
+            "Usage: /addfsub <@username|chat_id> [others…]\n"
+            "Examples: /addfsub @myChannel  -100123456789  t.me/mychannel"
+        )
+        return
+    raw = re.split(r"[,\s]+", parts[1].strip())
+    chans = [x for x in (s.lstrip("@").lstrip("#") for s in raw) if x]
+    new_list = add_forced_channels(chans)
+    await event.reply("✅ Forced-sub channels updated:\n" + "\n".join(f"• @{c}" for c in new_list))
+
+
+@bot.on(events.NewMessage(pattern=r"/delfsub(?:\s+.*)?"))
+async def delfsub_cmd(event):
+    user_id = event.sender_id
+    if not is_admin(user_id):
+        await event.reply("🚫 Admins only.")
+        return
+    text = event.raw_text or event.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        set_forced_channels([])
+        await event.reply("✅ All forced-sub channels removed.")
+        return
+    raw = re.split(r"[,\s]+", parts[1].strip())
+    chans = [x for x in (s.lstrip("@").lstrip("#") for s in raw) if x]
+    new_list = del_forced_channels(chans)
+    if new_list:
+        await event.reply("✅ Remaining forced-sub channels:\n" + "\n".join(f"• @{c}" for c in new_list))
+    else:
+        await event.reply("✅ No forced-sub channels configured.")
+
+
+@bot.on(events.NewMessage(pattern=r"/channels$"))
+async def channels_cmd(event):
+    user_id = event.sender_id
+    if not is_admin(user_id):
+        await event.reply("🚫 Admins only.")
+        return
+    chans = get_forced_channels()
+    if not chans:
+        await event.reply("ℹ️ No forced-sub channels configured.")
+        return
+    await event.reply("📋 Forced-sub channels:\n" + "\n".join(f"• @{c}" for c in chans))
 
 def clean_filename_text(text):
     """Cleans the text by removing all @usernames and hashtags"""
@@ -239,8 +485,8 @@ def load_user_preferences():
     except Exception as e:
         logging.error(f"Error loading preferences: {e}")
 
-# Initialize the Telethon client
-bot = TelegramClient('rename_bot', API_ID, API_HASH).start(bot_token=TOKEN)
+
+
 
 def load_user_usage():
     """Loads usage data from the file"""
@@ -501,8 +747,15 @@ def get_video_attributes(file_path, sanitized_name):
     return attributes
 
 async def ensure_video_compatibility(file_path, progress_msg=None):
-    """Vérifie et convertit si nécessaire la vidéo pour la compatibilité Telegram"""
+    """Version optimisée - évite la conversion sauf si absolument nécessaire"""
     
+    # NOUVEAU : Vérifier la taille du fichier
+    file_size = os.path.getsize(file_path)
+    if file_size > 100 * 1024 * 1024:  # Si > 100 Mo
+        # Ne PAS convertir les gros fichiers
+        return file_path
+    
+    # Le reste du code existant pour les petits fichiers...
     # Vérifier le codec avec ffprobe
     if not shutil.which("ffprobe"):
         return file_path  # Pas de ffprobe, on garde le fichier tel quel
@@ -642,14 +895,14 @@ async def clean_old_sessions():
 @bot.on(events.CallbackQuery(data="check_joined"))
 async def check_joined_handler(event):
     user_id = event.query.user_id
-    
-    if await is_user_in_channel(user_id):
+    ok, missing = await is_user_in_required_channels(user_id)
+    if ok:
         await event.answer("✅ Thank you! You can now use the bot.", alert=True)
         await event.delete()
         # Show welcome message
         await bot.send_message(user_id, "/start")
     else:
-        await event.answer("❌ You haven't joined the channel yet!", alert=True)
+        await event.answer("❌ You haven't joined all channels yet!", alert=True)
 
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
@@ -657,8 +910,9 @@ async def start_handler(event):
     user_id = event.sender_id
     
     # 🔥 FORCE JOIN CHECK 🔥
-    if not await is_user_in_channel(user_id):
-        await send_force_join_message(event)
+    ok, missing = await is_user_in_required_channels(user_id)
+    if not ok:
+        await send_force_join_message(event, missing)
         return
     
     # Load data if not already done
@@ -729,41 +983,69 @@ async def cancel_handler(event):
 
 @bot.on(events.NewMessage(pattern='/status'))
 async def status_handler(event):
-    """Handler to check bot status"""
+    """Enhanced status output similar to uploader bot."""
     active_sessions = len(user_sessions)
-    
-    # Check disk space (Windows compatible)
-    if os.name == 'nt':  # Windows
-        import shutil
-        total, used, free = shutil.disk_usage(TEMP_DIR)
-        free_space = free
-    else:  # Linux/Mac
-        stat = os.statvfs(TEMP_DIR)
-        free_space = stat.f_bavail * stat.f_frsize
-    
-    # Check ffmpeg
-    ffmpeg_status = "✅ Available" if shutil.which("ffmpeg") else "❌ Not available"
-    
-    status_text = """🤖 <b>Bot Status</b>
 
-✅ <b>Status:</b> Online
-👥 <b>Active Sessions:</b> {}
-💾 <b>Free Space:</b> {}
-📊 <b>Max File Size:</b> {}
-🎬 <b>FFmpeg:</b> {}
-📈 <b>Daily Limit:</b> {} per user
-⏱ <b>Cooldown:</b> {} seconds
+    # Ping
+    start = perf_counter()
+    try:
+        await bot.get_me()
+    except Exception:
+        pass
+    ping_ms = (perf_counter() - start) * 1000
 
-<i>Bot is running smoothly!</i>""".format(
-        active_sessions,
-        human_readable_size(free_space),
-        human_readable_size(MAX_FILE_SIZE),
-        ffmpeg_status,
-        human_readable_size(DAILY_LIMIT_BYTES),
-        COOLDOWN_SECONDS
+    # RAM/CPU (optional psutil)
+    try:
+        import psutil  # type: ignore
+        vm = psutil.virtual_memory()
+        ram_line = f"{vm.percent:.1f}% ({vm.used/1024/1024/1024:.2f} GB / {vm.total/1024/1024/1024:.2f} GB)"
+        cpu_line = f"{psutil.cpu_percent(interval=0.1):.1f}%"
+    except Exception:
+        ram_line = "N/A"
+        cpu_line = "N/A"
+
+    # Disk usage
+    try:
+        import shutil as _sh
+        total_b, used_b, free_b = _sh.disk_usage(os.getcwd())
+        used_pct = used_b / total_b * 100 if total_b else 0.0
+        slots = 12
+        filled = max(0, min(slots, int((used_pct / 100) * slots)))
+        bar = "[" + ("■" * filled) + ("□" * (slots - filled)) + "]"
+        disk_block = (
+            f"┎ DISK :\n"
+            f"┃ {bar} {used_pct:.1f}%\n"
+            f"┃ Used : {used_b/1024/1024/1024:.2f} GB\n"
+            f"┃ Free : {free_b/1024/1024/1024:.2f} GB\n"
+            f"┖ Total : {total_b/1024/1024/1024:.2f} GB\n"
+        )
+    except Exception:
+        disk_block = "┎ DISK :\n┖ N/A\n"
+
+    # Rename stats
+    try:
+        stats = await load_rename_stats()
+        total_renamed = int(stats.get("total_files_renamed", 0))
+        total_storage_used = float(stats.get("total_storage_bytes", 0.0))
+    except Exception:
+        total_renamed = 0
+        total_storage_used = 0.0
+
+    text = (
+        "⌬ BOT STATISTICS :\n\n"
+        f"┎ Bᴏᴛ Uᴘᴛɪᴍᴇ : {uptime_str()}\n"
+        f"┃ Cᴜʀʀᴇɴᴛ Pɪɴɢ : {ping_ms:.3f}ms\n"
+        f"┖ Aᴄᴛɪᴠᴇ Sᴇssɪᴏɴs: {active_sessions}\n\n"
+        f"┎ RAM ( MEMORY ):\n"
+        f"┖ {ram_line}\n\n"
+        f"┎ CPU ( USAGE ) :\n"
+        f"┖ {cpu_line}\n\n"
+        f"{disk_block}"
+        f"┎ RENAME STATISTICS :\n"
+        f"┃ Files renamed : {total_renamed}\n"
+        f"┖ Storage used : {format_bytes(total_storage_used)}\n"
     )
-    
-    await event.reply(status_text, parse_mode='html')
+    await event.reply(text, parse_mode='html')
 
 @bot.on(events.NewMessage(pattern='/usage'))
 async def usage_handler(event):
@@ -771,8 +1053,9 @@ async def usage_handler(event):
     user_id = event.sender_id
     
     # 🔥 FORCE JOIN CHECK 🔥
-    if not await is_user_in_channel(user_id):
-        await send_force_join_message(event)
+    ok, missing = await is_user_in_required_channels(user_id)
+    if not ok:
+        await send_force_join_message(event, missing)
         return
     
     usage_info = get_user_usage_info(user_id)
@@ -810,8 +1093,9 @@ async def settings_command(event):
     user_id = event.sender_id
     
     # 🔥 FORCE JOIN CHECK 🔥
-    if not await is_user_in_channel(user_id):
-        await send_force_join_message(event)
+    ok, missing = await is_user_in_required_channels(user_id)
+    if not ok:
+        await send_force_join_message(event, missing)
         return
     
     await show_settings_menu(event)
@@ -882,8 +1166,9 @@ async def setthumb_handler(event):
     user_id = event.sender_id
     
     # 🔥 FORCE JOIN CHECK 🔥
-    if not await is_user_in_channel(user_id):
-        await send_force_join_message(event)
+    ok, missing = await is_user_in_required_channels(user_id)
+    if not ok:
+        await send_force_join_message(event, missing)
         return
     
     # Store that the user wants to set a thumbnail
@@ -1297,14 +1582,13 @@ Send /cancel to abort."""
     elif data.startswith('rename_only_'):
         clicked_user_id = int(data.split('_')[2])
         if clicked_user_id == user_id and user_id in user_sessions:
-            user_sessions[user_id]['action'] = 'rename_caption_only'
+            user_sessions[user_id]['action'] = 'rename_only'
             # On stocke le file_id du fichier Telegram à réutiliser
             original_msg = user_sessions[user_id]['message']
             user_sessions[user_id]['file_id'] = original_msg.file.id
             user_sessions[user_id]['is_video'] = user_sessions[user_id].get('is_video', False)
             ask_msg = await event.edit(
-                "✏️ <b>Send me the new caption for this file :</b>\n\n"
-                "Le nom du fichier ne changera pas, seule la description sera modifiée.",
+                "✏️ <b>Send me the new name for this file :</b>",
                 parse_mode='html',
                 buttons=Button.inline("❌ Cancel", f"cancel_{user_id}")
             )
@@ -1448,29 +1732,17 @@ async def rename_handler(event):
 
             # Ré-envoi du fichier via file_id avec la nouvelle caption
             try:
-                if is_video:
-                    await event.client.send_file(
-                        event.chat_id,
-                        file=file_id,
-                        caption=new_caption,
-                        force_document=True,  # ou False si tu veux l'envoyer comme "video"
-                        parse_mode='html',
-                        file_name=original_file_name,
-                        supports_streaming=True,
-                        allow_cache=False
-                    )
-                else:
-                    await event.client.send_file(
-                        event.chat_id,
-                        file=file_id,
-                        caption=new_caption,
-                        force_document=True,
-                        parse_mode='html',
-                        file_name=original_file_name,
-                        allow_cache=False
-                    )
+                # NOUVEAU : On utilise `process_large_file_streaming` pour le renommage
+                await process_large_file_streaming(event, user_id, new_name)
+                
                 # Message de succès
-                await event.reply("✅ Caption updated! (File name unchanged.)")
+                await event.reply("✅ File renamed successfully!")
+                try:
+                    sz = int(user_sessions.get(user_id, {}).get('file_size') or 0)
+                    await add_rename_stat(sz)
+                except Exception:
+                    pass
+
             except Exception as e:
                 await event.reply(f"❌ Error: {str(e)}")
 
@@ -1626,6 +1898,10 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
         if user_id in user_sessions and 'file_size' in user_sessions[user_id]:
             update_user_usage(user_id, user_sessions[user_id]['file_size'])
             logging.info(f"Usage updated for user {user_id}: +{human_readable_size(user_sessions[user_id]['file_size'])}")
+            try:
+                await add_rename_stat(int(user_sessions[user_id]['file_size'] or 0))
+            except Exception:
+                pass
         
     except FloodWaitError as e:
         if progress_msg:
@@ -1686,6 +1962,18 @@ async def process_with_thumbnail(event, user_id, new_name):
         custom_username = sessions.get(user_id, {}).get('custom_username', '')
         if custom_username:
             sanitized_name = add_custom_text_to_filename(sanitized_name, custom_username, text_position)
+
+        # Ensure correct extension is kept/added (crucial for inline playback)
+        try:
+            original_name = user_sessions[user_id].get('file_name') or ''
+            original_ext = os.path.splitext(original_name)[1]
+            # Default to .mp4 for videos if extension is missing
+            if not original_ext and user_sessions[user_id].get('is_video', False):
+                original_ext = '.mp4'
+            if original_ext and not sanitized_name.lower().endswith(original_ext.lower()):
+                sanitized_name += original_ext
+        except Exception:
+            pass
         
         progress_msg = await event.reply("🖼️ <b>Processing with thumbnail...</b>", parse_mode='html')
         
@@ -1747,16 +2035,21 @@ async def process_with_thumbnail(event, user_id, new_name):
             parse_mode='html',
             file_name=sanitized_name,
             thumb=thumb_path,
-            supports_streaming=True,  # ✅ Toujours True
-            force_document=True,      # ✅ Toujours True
+            supports_streaming=True,
+            # IMPORTANT: send as video (not document) to keep inline player
+            force_document=not user_sessions[user_id].get('is_video', False),
             attributes=file_attributes,
-            allow_cache=False         # ✅ Force Telegram à régénérer les previews
+            allow_cache=False
         )
         
         await progress_msg.delete()
         
         # Update usage
         update_user_usage(user_id, file_size)
+        try:
+            await add_rename_stat(int(file_size or 0))
+        except Exception:
+            pass
         
         # Clean up
         try:

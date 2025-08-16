@@ -1,0 +1,7 @@
+# config.py
+API_ID=22142337 
+API_HASH="18eef60818a0a15ab2e8bcaeac66698e"
+ADMIN_IDS="7570539064,7615697178" # IDs des admins sous forme de chaîne, séparés par des virgules
+TOKEN = "7493657915:AAFUzewRnCTafjV0f_xannL5meOA6A6Gs8I"
+SESSION_STRING = "NXHn4KcV7IJoaa08Wf3cYxE7IYfdamR3LYn_0hJ-sFcdXA5j1-Rjrbw6INjbLtb5YOtSgRmxG64sH6j3MApxWAkPO_uryZwXhglH6jYUndSSsCvCwAeR99MJNDz5aLyNsryCTPgGotsL7wuCfFYDswxRHoZfHHdYdr4r0vFOXEHwnBJCpRPfo_vk9J37uwj0ci4fwmDHvULLTpXRdp5-NZWTB8g2LsKn2oUgw="
+
