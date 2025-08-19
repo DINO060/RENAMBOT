@@ -1227,8 +1227,9 @@ async def showthumb_handler(event):
     user_id = event.sender_id
     
     # 🔥 FORCE JOIN CHECK 🔥
-    if not await is_user_in_channel(user_id):
-        await send_force_join_message(event)
+    ok, missing = await is_user_in_required_channels(user_id)
+    if not ok:
+        await send_force_join_message(event, missing)
         return
     
     thumb_path = os.path.join(THUMBNAIL_DIR, "{}.jpg".format(user_id))
@@ -1298,8 +1299,9 @@ async def file_handler(event):
     user_id = event.sender_id
     
     # 🔥 FORCE JOIN CHECK 🔥
-    if not await is_user_in_channel(user_id):
-        await send_force_join_message(event)
+    ok, missing = await is_user_in_required_channels(user_id)
+    if not ok:
+        await send_force_join_message(event, missing)
         return
     
     # Clean up old sessions
