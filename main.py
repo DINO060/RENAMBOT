@@ -74,13 +74,14 @@ async def safe_edit(msg_obj, new_text, **kwargs):
 # 🔥 FORCE JOIN CHANNEL CONFIGURATION 🔥 (legacy single channel kept as fallback)
 FORCE_JOIN_CHANNEL = "djd208"  # fallback if no channels configured in JSON
 
-async def process_large_file_streaming(event, user_id, new_name):
+async def process_large_file_streaming(event, user_id, new_name, sess=None):
     """Re-send the original media with a new filename/caption without re-downloading.
     Mirrors the PDF bot's Edit Name behavior.
     """
-    if user_id not in user_sessions:
+    if sess is None and user_id not in user_sessions:
         return
-    original_msg = user_sessions[user_id]['message']
+    base_info = sess if sess is not None else user_sessions[user_id]
+    original_msg = base_info['message']
     sanitized_name = sanitize_filename(new_name)
     
     # Apply user preferences (clean tags, custom text, username)
@@ -101,7 +102,7 @@ async def process_large_file_streaming(event, user_id, new_name):
     caption = f"<code>{sanitized_name}</code>"
     
     # Determine if media is video to keep player (avoid forcing document)
-    is_video = user_sessions[user_id].get('is_video', False)
+    is_video = base_info.get('is_video', False)
     force_document = False if is_video else True
     
     logging.info(f"[RenameOnly] Resending media for user {user_id}: name='{sanitized_name}', is_video={is_video}, force_document={force_document}")
@@ -296,8 +297,11 @@ async def add_rename_stat(file_size_bytes: int) -> None:
         with open(RENAME_STATS_PATH, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-# Dictionary to store user sessions
+# Dictionary to store user sessions (legacy: single active)
 user_sessions = {}
+# New: store sessions per message so multiple files can be handled concurrently
+# Key: (user_id, bot_message_id)
+user_sessions_by_msg = {}
 
 # Usage limits system
 user_usage = defaultdict(lambda: {'daily_bytes': 0, 'last_reset': None, 'last_file_time': None})
@@ -626,6 +630,18 @@ async def cleanup_user_files(user_id):
                 except:
                     pass
             del user_sessions[user_id]
+
+        # Also clean per-message sessions for this user
+        remove_keys = [(uid, mid) for (uid, mid) in list(user_sessions_by_msg.keys()) if uid == user_id]
+        for key in remove_keys:
+            sess = user_sessions_by_msg.pop(key, None)
+            if not sess:
+                continue
+            if 'temp_path' in sess:
+                try:
+                    os.remove(sess['temp_path'])
+                except:
+                    pass
             
         logging.info(f"Full cleanup completed for user {user_id}")
         return True
@@ -930,6 +946,26 @@ async def clean_old_sessions():
                 pass
         del user_sessions[user_id]
 
+    # New: also clean per-message sessions
+    expired_keys = []
+    for (uid, mid), data in list(user_sessions_by_msg.items()):
+        ts = data.get('timestamp')
+        try:
+            if ts and (current_time - ts > timedelta(seconds=USER_TIMEOUT)):
+                expired_keys.append((uid, mid))
+        except Exception:
+            # If timestamp invalid, expire defensively
+            expired_keys.append((uid, mid))
+    for key in expired_keys:
+        sess = user_sessions_by_msg.pop(key, None)
+        if not sess:
+            continue
+        if 'temp_path' in sess:
+            try:
+                os.remove(sess['temp_path'])
+            except:
+                pass
+
 # 🔥 HANDLER FOR THE "I HAVE JOINED" BUTTON 🔥
 @bot.on(events.CallbackQuery(data="check_joined"))
 async def check_joined_handler(event):
@@ -1031,7 +1067,7 @@ async def cancel_handler(event):
 @bot.on(events.NewMessage(pattern='/status'))
 async def status_handler(event):
     """Enhanced status output similar to uploader bot."""
-    active_sessions = len(user_sessions)
+    active_sessions = len(user_sessions_by_msg)
 
     # Ping
     start = perf_counter()
@@ -1454,11 +1490,27 @@ async def file_handler(event):
         usage_info['percentage']
     )
     
-    await event.reply(
+    # Send the info card and keep its message id to bind callbacks
+    info_msg = await event.reply(
         info_text, 
         parse_mode='html',
         buttons=buttons
     )
+
+    # Store session bound to this info message id
+    try:
+        user_sessions_by_msg[(user_id, info_msg.id)] = {
+            'message': event.message,
+            'media_info_msg': info_msg,
+            'file_name': file_name,
+            'file_size': file_size_bytes,
+            'mime_type': mime_type,
+            'timestamp': datetime.now(),
+            'has_thumbnail': has_thumbnail,
+            'is_video': is_video
+        }
+    except Exception:
+        pass
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
@@ -1584,73 +1636,68 @@ Send /cancel to abort."""
         return
     
     elif data.startswith('add_thumb_'):
-        clicked_user_id = int(data.split('_')[2])
-        if clicked_user_id == user_id and user_id in user_sessions:
-            thumb_path = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
-            if not os.path.exists(thumb_path):
-                await event.answer("❌ No thumbnail set! Use /setthumb first.", alert=True)
-                return
-            
-            # Get file info
-            file_info = user_sessions[user_id]
-            file_name = file_info['file_name']
-            file_size = human_readable_size(file_info['file_size'])
-            extension = os.path.splitext(file_name)[1] or "Unknown"
-            original_msg = file_info['message']
-            mime_type = original_msg.file.mime_type or "Unknown"
-            dc_id = original_msg.file.dc_id if hasattr(original_msg.file, 'dc_id') else "N/A"
-            
-            # Display MEDIA INFO card
-            info_card = f"""📁 <b>MEDIA INFO</b>
-
-📁 <b>FILE NAME:</b> <code>{file_name}</code>
-🧩 <b>EXTENSION:</b> <code>{extension}</code>
-📦 <b>FILE SIZE:</b> {file_size}
-🪄 <b>MIME TYPE:</b> {mime_type}
-🧭 <b>DC ID:</b> {dc_id}
-
-<b>PLEASE ENTER THE NEW FILENAME WITH EXTENSION AND REPLY THIS MESSAGE.</b>"""
-            
-            # Store action
-            user_sessions[user_id]['action'] = 'add_thumbnail_rename'
-            
-            # Send message and store ID
-            ask_msg = await event.edit(info_card, parse_mode='html')
-            user_sessions[user_id]['reply_id'] = ask_msg.id
-            user_sessions[user_id]['media_info_msg'] = ask_msg
+        # Per-message session resolution
+        sess_key = (user_id, event.message_id)
+        sess = user_sessions_by_msg.get(sess_key)
+        if sess is None:
+            await event.answer("❌ This is not for you or session expired.", alert=True)
+            return
+        thumb_path = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
+        if not os.path.exists(thumb_path):
+            await event.answer("❌ No thumbnail set! Use /setthumb first.", alert=True)
+            return
+        file_name = sess.get('file_name', 'Unknown')
+        file_size = human_readable_size(sess.get('file_size', 0))
+        extension = os.path.splitext(file_name)[1] or "Unknown"
+        
+        info_card = (
+            "🖼️ <b>Add Thumbnail + Rename</b>\n\n"
+            f"<b>File:</b> <code>{file_name}</code>\n"
+            f"<b>Size:</b> {file_size}\n"
+            f"<b>Type:</b> {extension}\n\n"
+            "<b>PLEASE ENTER THE NEW FILENAME WITH EXTENSION AND REPLY THIS MESSAGE.</b>"
+        )
+        
+        # Store action
+        sess['action'] = 'add_thumbnail_rename'
+        ask_msg = await event.edit(info_card, parse_mode='html')
+        sess['reply_id'] = ask_msg.id
+        sess['media_info_msg'] = ask_msg
+        user_sessions_by_msg[sess_key] = sess
+        
+    elif data.startswith('cancel_'):
+        # Resolve per-message session using the pressed message id
+        sess_key = (user_id, event.message_id)
+        sess = user_sessions_by_msg.get(sess_key)
+        if sess is not None:
+            try:
+                if 'temp_path' in sess:
+                    try:
+                        os.remove(sess['temp_path'])
+                    except:
+                        pass
+                await event.edit("❌ <b>Operation cancelled.</b>", parse_mode='html')
+            finally:
+                user_sessions_by_msg.pop(sess_key, None)
         else:
             await event.answer("❌ This is not for you or session expired.", alert=True)
-
-    if data.startswith('cancel_'):
-        clicked_user_id = int(data.split('_')[1])
-        if clicked_user_id == user_id and user_id in user_sessions:
-            if 'temp_path' in user_sessions[user_id]:
-                try:
-                    os.remove(user_sessions[user_id]['temp_path'])
-                except:
-                    pass
-            del user_sessions[user_id]
-            await event.edit("❌ <b>Operation cancelled.</b>", parse_mode='html')
-        else:
-            await event.answer("❌ You can't cancel this operation.", alert=True)
             
     elif data.startswith('rename_only_'):
-        clicked_user_id = int(data.split('_')[2])
-        if clicked_user_id == user_id and user_id in user_sessions:
-            user_sessions[user_id]['action'] = 'rename_only'
-            # On stocke le file_id du fichier Telegram à réutiliser
-            original_msg = user_sessions[user_id]['message']
-            user_sessions[user_id]['file_id'] = original_msg.file.id
-            user_sessions[user_id]['is_video'] = user_sessions[user_id].get('is_video', False)
+        # Bind action to the session for this message
+        sess_key = (user_id, event.message_id)
+        sess = user_sessions_by_msg.get(sess_key)
+        if sess is not None:
+            sess['action'] = 'rename_only'
             ask_msg = await event.edit(
                 "✏️ <b>Send me the new name for this file :</b>",
                 parse_mode='html',
                 buttons=Button.inline("❌ Cancel", f"cancel_{user_id}")
             )
-            user_sessions[user_id]['reply_id'] = ask_msg.id
-            user_sessions[user_id]['rename_prompt_msg'] = ask_msg
+            sess['reply_id'] = ask_msg.id
+            sess['rename_prompt_msg'] = ask_msg
+            user_sessions_by_msg[sess_key] = sess
         else:
-            await event.answer("❌ Ce n'est pas pour toi ou la session a expiré.", alert=True)
+            await event.answer("❌ This is not for you or session expired.", alert=True)
 
 
 
@@ -1733,25 +1780,19 @@ async def rename_handler(event):
     """Improved handler for renaming files"""
     user_id = event.sender_id
     
-    # Check if user has an active session
-    if user_id not in user_sessions:
-        return
-    
-    action = user_sessions[user_id].get('action')
-    if action not in ['rename_only', 'add_thumbnail_rename', 'rename_caption_only']:
-        return
-    
     # Clean up old sessions
     await clean_old_sessions()
-    
-    # Check if session has expired
-    if user_id not in user_sessions:
-        await event.reply("⏱ Session expired. Please send the file again.")
+
+    # Resolve session by reply-to message id
+    reply_to_id = getattr(getattr(event, 'message', None), 'reply_to_msg_id', None)
+    if reply_to_id is None:
         return
-    
-    reply_to = await event.get_reply_message()
-    # Ensure user replies to the correct message
-    if reply_to.id != user_sessions[user_id].get('reply_id'):
+    sess_key = (user_id, reply_to_id)
+    sess = user_sessions_by_msg.get(sess_key)
+    if not sess:
+        return  # Not a tracked rename session
+    action = sess.get('action')
+    if action not in ['rename_only', 'add_thumbnail_rename', 'rename_caption_only']:
         return
     
     new_name = event.text.strip()
@@ -1762,9 +1803,8 @@ async def rename_handler(event):
         return
     
     # Add extension if missing
-    extension_added = False
-    if "." not in new_name and "." in user_sessions[user_id]['file_name']:
-        original_ext = os.path.splitext(user_sessions[user_id]['file_name'])[1]
+    if "." not in new_name and "." in sess.get('file_name', ''):
+        original_ext = os.path.splitext(sess.get('file_name', ''))[1]
         new_name += original_ext
         extension_added = True
         await event.reply(f"ℹ️ Extension added automatically: <code>{new_name}</code>", parse_mode='html')
@@ -1772,28 +1812,27 @@ async def rename_handler(event):
     # Process based on action
     try:
         if action == 'rename_only':
-            # Fast path: reuse original media, change only filename/caption
-            await process_large_file_streaming(event, user_id, new_name)
+            await process_large_file_streaming(event, user_id, new_name, sess=sess)
             await event.reply("✅ File renamed successfully!")
             try:
-                sz = int(user_sessions.get(user_id, {}).get('file_size') or 0)
+                sz = int(sess.get('file_size') or 0)
                 await add_rename_stat(sz)
                 update_user_usage(user_id, sz)
             except Exception:
                 pass
 
             # Clean prompts and session
-            if 'rename_prompt_msg' in user_sessions[user_id]:
+            if 'rename_prompt_msg' in sess:
                 try:
-                    await user_sessions[user_id]['rename_prompt_msg'].delete()
+                    await sess['rename_prompt_msg'].delete()
                 except:
                     pass
-            if 'media_info_msg' in user_sessions[user_id]:
+            if 'media_info_msg' in sess:
                 try:
-                    await user_sessions[user_id]['media_info_msg'].delete()
+                    await sess['media_info_msg'].delete()
                 except:
                     pass
-            del user_sessions[user_id]
+            user_sessions_by_msg.pop(sess_key, None)
             return
 
         if action == 'rename_caption_only':
@@ -1837,32 +1876,33 @@ async def rename_handler(event):
             
 
         elif action == 'add_thumbnail_rename':
-            await process_with_thumbnail(event, user_id, new_name)
+            await process_with_thumbnail(event, user_id, new_name, sess=sess)
         
-        # NEW: Delete MEDIA INFO message if present
-        if 'media_info_msg' in user_sessions.get(user_id, {}):
+        # Delete prompt/info messages tied to this session
+        if 'media_info_msg' in sess:
             try:
-                await user_sessions[user_id]['media_info_msg'].delete()
+                await sess['media_info_msg'].delete()
             except:
-                pass  # Ignore if already deleted
-        
-        # NEW: Delete rename_only prompt message if present
-        if 'rename_prompt_msg' in user_sessions.get(user_id, {}):
+                pass
+        if 'rename_prompt_msg' in sess:
             try:
-                await user_sessions[user_id]['rename_prompt_msg'].delete()
+                await sess['rename_prompt_msg'].delete()
             except:
-                pass  # Ignore if already deleted
+                pass
+
+        # Remove only this session entry
+        user_sessions_by_msg.pop(sess_key, None)
                 
     except Exception as e:
         # If an error occurs, handle it here
         if "Content of the message was not modified" not in str(e):
             raise
 
-async def process_file(event, user_id, new_name=None, use_thumb=False):
+async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None):
     """Generic function to process (download and upload) a file."""
     
-    if user_id not in user_sessions:
-        # Session might have expired or been cancelled
+    # Prefer per-message session if provided
+    if sess is None and user_id not in user_sessions:
         return
 
     progress_msg = None
@@ -1871,7 +1911,8 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
 
     try:
         if new_name is None:
-            new_name = user_sessions[user_id]['file_name']
+            base_info = sess if sess is not None else user_sessions[user_id]
+            new_name = base_info['file_name']
         
         sanitized_name = sanitize_filename(new_name)
         # Add custom text if present
@@ -1895,12 +1936,16 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
             SendMessageUploadDocumentAction(progress=0)
         ))
         
-        original_msg = user_sessions[user_id]['message']
-        is_video = user_sessions[user_id].get('is_video', False)
+        base_info = sess if sess is not None else user_sessions[user_id]
+        original_msg = base_info['message']
+        is_video = base_info.get('is_video', False)
         
         temp_filename = "{}_{}_{}".format(user_id, int(time.time()), uuid.uuid4().hex[:8])
         temp_path = os.path.join(TEMP_DIR, temp_filename)
-        user_sessions[user_id]['temp_path'] = temp_path
+        if sess is not None:
+            sess['temp_path'] = temp_path
+        else:
+            user_sessions[user_id]['temp_path'] = temp_path
         
         start_time = time.time()
         last_update_time = [start_time]
@@ -1975,9 +2020,10 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
         await progress_msg.delete()
         
         # Update user usage after successful processing
-        if user_id in user_sessions and 'file_size' in user_sessions[user_id]:
-            update_user_usage(user_id, user_sessions[user_id]['file_size'])
-            logging.info(f"Usage updated for user {user_id}: +{human_readable_size(user_sessions[user_id]['file_size'])}")
+        size_val = (sess or {}).get('file_size') if sess is not None else user_sessions.get(user_id, {}).get('file_size')
+        if size_val is not None:
+            update_user_usage(user_id, size_val)
+            logging.info(f"Usage updated for user {user_id}: +{human_readable_size(size_val)}")
             try:
                 await add_rename_stat(int(user_sessions[user_id]['file_size'] or 0))
             except Exception:
@@ -2009,17 +2055,18 @@ async def process_file(event, user_id, new_name=None, use_thumb=False):
             except OSError as e:
                 logging.error(f"Error deleting reencoded_path {reencoded_path}: {e}")
 
-        if user_id in user_sessions:
+        # Only delete legacy session if we were operating on it
+        if sess is None and user_id in user_sessions:
             del user_sessions[user_id]
 
 
 
 
 
-async def process_with_thumbnail(event, user_id, new_name):
+async def process_with_thumbnail(event, user_id, new_name, sess=None):
     """Processes the file with thumbnail and new name"""
     
-    if user_id not in user_sessions:
+    if sess is None and user_id not in user_sessions:
         return
     
     progress_msg = None
@@ -2138,18 +2185,20 @@ async def process_with_thumbnail(event, user_id, new_name):
             pass
         
         # Delete prompt messages before cleaning up the session
-        if 'media_info_msg' in user_sessions.get(user_id, {}):
+        if sess is not None and 'media_info_msg' in sess:
             try:
-                await user_sessions[user_id]['media_info_msg'].delete()
+                await sess['media_info_msg'].delete()
             except:
                 pass
-        if 'rename_prompt_msg' in user_sessions.get(user_id, {}):
+        if sess is not None and 'rename_prompt_msg' in sess:
             try:
-                await user_sessions[user_id]['rename_prompt_msg'].delete()
+                await sess['rename_prompt_msg'].delete()
             except:
                 pass
         
-        del user_sessions[user_id]
+        # Only delete legacy session if no per-message session was used
+        if sess is None and user_id in user_sessions:
+            del user_sessions[user_id]
         
     except Exception as e:
         error_msg = f"❌ <b>Error:</b> {str(e)}"
