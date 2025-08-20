@@ -74,6 +74,26 @@ async def safe_edit(msg_obj, new_text, **kwargs):
 # 🔥 FORCE JOIN CHANNEL CONFIGURATION 🔥 (legacy single channel kept as fallback)
 FORCE_JOIN_CHANNEL = "djd208"  # fallback if no channels configured in JSON
 
+async def process_large_file_streaming(event, user_id, new_name):
+    """Re-send the original media with a new filename/caption without re-downloading.
+    Mirrors the PDF bot's Edit Name behavior.
+    """
+    if user_id not in user_sessions:
+        return
+    original_msg = user_sessions[user_id]['message']
+    sanitized_name = sanitize_filename(new_name)
+    # Keep a minimal caption that matches rename-only UX
+    caption = f"<code>{sanitized_name}</code>"
+    await event.client.send_file(
+        event.chat_id,
+        original_msg.media,
+        caption=caption,
+        parse_mode='html',
+        file_name=sanitized_name,
+        supports_streaming=True,
+        force_document=True
+    )
+
 # --- Admin parsing & force-join JSON (multi-channel) ---
 def _parse_admin_ids(s: str):
     ids = set()
@@ -1206,8 +1226,9 @@ async def delthumb_handler(event):
     user_id = event.sender_id
     
     # 🔥 FORCE JOIN CHECK 🔥
-    if not await is_user_in_channel(user_id):
-        await send_force_join_message(event)
+    ok, missing = await is_user_in_required_channels(user_id)
+    if not ok:
+        await send_force_join_message(event, missing)
         return
     
     thumb_path = os.path.join(THUMBNAIL_DIR, "{}.jpg".format(user_id))
@@ -1718,6 +1739,31 @@ async def rename_handler(event):
     
     # Process based on action
     try:
+        if action == 'rename_only':
+            # Fast path: reuse original media, change only filename/caption
+            await process_large_file_streaming(event, user_id, new_name)
+            await event.reply("✅ File renamed successfully!")
+            try:
+                sz = int(user_sessions.get(user_id, {}).get('file_size') or 0)
+                await add_rename_stat(sz)
+                update_user_usage(user_id, sz)
+            except Exception:
+                pass
+
+            # Clean prompts and session
+            if 'rename_prompt_msg' in user_sessions[user_id]:
+                try:
+                    await user_sessions[user_id]['rename_prompt_msg'].delete()
+                except:
+                    pass
+            if 'media_info_msg' in user_sessions[user_id]:
+                try:
+                    await user_sessions[user_id]['media_info_msg'].delete()
+                except:
+                    pass
+            del user_sessions[user_id]
+            return
+
         if action == 'rename_caption_only':
             # Changer seulement la caption (comme "Edit Name" du bot PDF)
             file_id = user_sessions[user_id].get('file_id')
