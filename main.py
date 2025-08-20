@@ -1329,22 +1329,27 @@ async def file_handler(event):
     await clean_old_sessions()
     
     file = event.file
+    # Some forwarded media can have size=None; guard against it
+    try:
+        file_size_bytes = int(file.size) if getattr(file, 'size', None) is not None else 0
+    except Exception:
+        file_size_bytes = 0
     
-    # Check file size
-    if file.size > MAX_FILE_SIZE:
+    # Check file size (only if known)
+    if file_size_bytes and file_size_bytes > MAX_FILE_SIZE:
         await event.reply(
             "❌ <b>File too large!</b>\n\n"
             "Maximum size: {}\n"
             "Your file: {}".format(
                 human_readable_size(MAX_FILE_SIZE),
-                human_readable_size(file.size)
+                human_readable_size(file_size_bytes)
             ),
             parse_mode='html'
         )
         return
     
     # Check user limits
-    limit_ok, limit_message = check_user_limits(user_id, file.size)
+    limit_ok, limit_message = check_user_limits(user_id, file_size_bytes)
     if not limit_ok:
         await event.reply(
             "⚠️ <b>Usage Limit Reached!</b>\n\n{}\n\nUse /usage to check your limits.".format(limit_message),
@@ -1354,7 +1359,7 @@ async def file_handler(event):
     
     # Get file information
     file_name = file.name or "unnamed_file"
-    file_size = human_readable_size(file.size)
+    file_size = human_readable_size(file_size_bytes)
     extension = os.path.splitext(file_name)[1] or ""
     mime_type = file.mime_type or "unknown"
     
@@ -1368,7 +1373,7 @@ async def file_handler(event):
         'timestamp': datetime.now(),
         'action': None,
         'is_video': is_video,
-        'file_size': file.size,  # Store size for usage update
+        'file_size': file_size_bytes,  # Store safe size for usage update
         'current_caption': event.message.message if event.message.message else 'None'  # Store current caption
     }
     
