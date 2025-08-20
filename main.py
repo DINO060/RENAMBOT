@@ -82,17 +82,44 @@ async def process_large_file_streaming(event, user_id, new_name):
         return
     original_msg = user_sessions[user_id]['message']
     sanitized_name = sanitize_filename(new_name)
-    # Keep a minimal caption that matches rename-only UX
+    
+    # Apply user preferences (clean tags, custom text, username)
+    try:
+        if sessions.get(user_id, {}).get('clean_tags', True):
+            sanitized_name = clean_filename_text(sanitized_name)
+        custom_text = sessions.get(user_id, {}).get('custom_text', '')
+        text_position = sessions.get(user_id, {}).get('text_position', 'end')
+        if custom_text:
+            sanitized_name = add_custom_text_to_filename(sanitized_name, custom_text, text_position)
+        custom_username = sessions.get(user_id, {}).get('custom_username', '')
+        if custom_username:
+            sanitized_name = add_custom_text_to_filename(sanitized_name, custom_username, text_position)
+    except Exception as e:
+        logging.warning(f"Preference application failed in rename-only: {e}")
+    
+    # Caption matches rename-only UX
     caption = f"<code>{sanitized_name}</code>"
-    await event.client.send_file(
-        event.chat_id,
-        original_msg.media,
-        caption=caption,
-        parse_mode='html',
-        file_name=sanitized_name,
-        supports_streaming=True,
-        force_document=True
-    )
+    
+    # Determine if media is video to keep player (avoid forcing document)
+    is_video = user_sessions[user_id].get('is_video', False)
+    force_document = False if is_video else True
+    
+    logging.info(f"[RenameOnly] Resending media for user {user_id}: name='{sanitized_name}', is_video={is_video}, force_document={force_document}")
+    
+    try:
+        await event.client.send_file(
+            event.chat_id,
+            original_msg.media,
+            caption=caption,
+            parse_mode='html',
+            file_name=sanitized_name,
+            supports_streaming=True,
+            force_document=force_document
+        )
+        logging.info(f"[RenameOnly] send_file success for user {user_id}")
+    except Exception as e:
+        logging.error(f"[RenameOnly] send_file failed for user {user_id}: {e}")
+        raise
 
 # --- Admin parsing & force-join JSON (multi-channel) ---
 def _parse_admin_ids(s: str):
