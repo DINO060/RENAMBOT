@@ -84,7 +84,7 @@ async def process_large_file_streaming(event, user_id, new_name, sess=None):
     original_msg = base_info['message']
     sanitized_name = sanitize_filename(new_name)
     
-    # Apply user preferences (clean tags, custom text, username)
+    # Apply user preferences (clean tags, custom text)
     try:
         if sessions.get(user_id, {}).get('clean_tags', True):
             sanitized_name = clean_filename_text(sanitized_name)
@@ -92,9 +92,6 @@ async def process_large_file_streaming(event, user_id, new_name, sess=None):
         text_position = sessions.get(user_id, {}).get('text_position', 'end')
         if custom_text:
             sanitized_name = add_custom_text_to_filename(sanitized_name, custom_text, text_position)
-        custom_username = sessions.get(user_id, {}).get('custom_username', '')
-        if custom_username:
-            sanitized_name = add_custom_text_to_filename(sanitized_name, custom_username, text_position)
     except Exception as e:
         logging.warning(f"Preference application failed in rename-only: {e}")
     
@@ -310,8 +307,6 @@ usage_file = "user_usage.json"
 # User preferences system
 sessions = {}  # To store user preferences
 
-DEFAULT_USERNAME = "@dino_renamebot"  # Put your real username here
-
 # HELPER FUNCTION TO GET LOCAL FILE PATH
 def get_local_file_path(user_id, file_id, extension):
     """Returns the local path of a file"""
@@ -487,17 +482,7 @@ def add_custom_text_to_filename(filename, custom_text=None, position='end'):
     
     return f"{name}{ext}"
 
-def add_default_username_to_filename(filename, username, position='end'):
-    name, ext = os.path.splitext(filename)
-    # Avoid adding it multiple times
-    if username.lower() in name.lower():
-        return filename
-    if position == 'end':
-        name = f"{name} {username}"
-    else:
-        name = f"{username} {name}"
-    name = re.sub(r'\s+', ' ', name).strip()
-    return f"{name}{ext}"
+ 
 
 def save_user_preferences():
     """Saves user preferences"""
@@ -1194,7 +1179,6 @@ async def show_settings_menu(event):
     custom_text = sessions.get(user_id, {}).get('custom_text', '')
     text_position = sessions.get(user_id, {}).get('text_position', 'end')
     clean_tags = sessions.get(user_id, {}).get('clean_tags', True)
-    custom_username = sessions.get(user_id, {}).get('custom_username', '')
     
     text = "⚙️ <b>Bot Settings</b>\n\n"
     
@@ -1203,15 +1187,12 @@ async def show_settings_menu(event):
         text += f"📍 Position: {text_position}\n"
     else:
         text += "📝 No custom text set\n"
-    if custom_username:
-        text += f"👤 Username: <code>{custom_username}</code>\n"
     
     text += f"🧹 Auto-clean tags: {'Yes' if clean_tags else 'No'}\n\n"
     text += "Choose an option:"
     
     keyboard = [
         [Button.inline("➕ Add/Edit Custom Text", "add_custom_text")],
-        [Button.inline("👤 Add/Edit Username", "add_custom_username")],
         [Button.inline("📍 Change Position", "change_text_position")],
         [Button.inline("🗑️ Remove Custom Text", "remove_custom_text")],
         [Button.inline("🧹 Toggle Clean Tags", "toggle_clean_tags")],
@@ -1617,18 +1598,7 @@ Send /cancel to abort."""
         await event.delete()
         return
     
-    # Add/Edit Username
-    elif data == "add_custom_username":
-        if user_id not in sessions:
-            sessions[user_id] = {}
-        sessions[user_id]['awaiting_custom_username'] = True
-        current_username = sessions[user_id].get('custom_username', '')
-        message = "👤 <b>Add/Edit Username</b>\n\n"
-        if current_username:
-            message += f"Current: <code>{current_username}</code>\n\n"
-        message += "Send me the username to add to all filenames (e.g. <code>@mychannel</code>).\n\nSend /cancel to abort."
-        await event.edit(message, parse_mode='html')
-        return
+    
     
     # Nouveau : Gestion du "pas de miniature"
     if data.startswith('no_thumb_'):
@@ -1736,10 +1706,6 @@ async def text_handler(event):
     if sessions[user_id].get('awaiting_custom_text'):
         custom_text = event.text.strip()
         
-        if len(custom_text) > 50:
-            await event.reply("❌ Text too long! Maximum 50 characters.")
-            return
-        
         # Save the text
         sessions[user_id]['custom_text'] = custom_text
         sessions[user_id]['awaiting_custom_text'] = False
@@ -1758,22 +1724,7 @@ async def text_handler(event):
             parse_mode='html'
         )
         return
-    # If waiting for custom username
-    if sessions[user_id].get('awaiting_custom_username'):
-        username = event.text.strip()
-        if not username.startswith('@') or len(username) > 64:
-            await event.reply("❌ Username must start with @ and be shorter than 64 characters.")
-            return
-        sessions[user_id]['custom_username'] = username
-        sessions[user_id]['awaiting_custom_username'] = False
-        save_user_preferences()
-        await event.reply(
-            f"✅ <b>Username saved!</b>\n\n"
-            f"Username: <code>{username}</code>\n"
-            f"This will be added to all renamed files.",
-            parse_mode='html'
-        )
-        return
+    
 
 @bot.on(events.NewMessage(func=lambda e: e.is_reply))
 async def rename_handler(event):
@@ -1920,10 +1871,6 @@ async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None
         text_position = sessions.get(user_id, {}).get('text_position', 'end')
         if custom_text:
             sanitized_name = add_custom_text_to_filename(sanitized_name, custom_text, text_position)
-        # Add custom username if present
-        custom_username = sessions.get(user_id, {}).get('custom_username', '')
-        if custom_username:
-            sanitized_name = add_custom_text_to_filename(sanitized_name, custom_username, text_position)
         
         # Progress message
         if isinstance(event, events.CallbackQuery.Event):
@@ -2086,9 +2033,6 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         if custom_text:
             sanitized_name = add_custom_text_to_filename(sanitized_name, custom_text, text_position)
         
-        custom_username = sessions.get(user_id, {}).get('custom_username', '')
-        if custom_username:
-            sanitized_name = add_custom_text_to_filename(sanitized_name, custom_username, text_position)
 
         # Ensure correct extension is kept/added (crucial for inline playback)
         try:
