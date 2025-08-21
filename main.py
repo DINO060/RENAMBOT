@@ -299,6 +299,29 @@ user_sessions = {}
 # Processing locks to avoid double-click race per (chat_id, msg_id)
 PROCESSING_LOCKS = defaultdict(asyncio.Lock)
 
+# Hybrid stateless cache of original messages to avoid get_messages issues in private chats
+# Key: (chat_id, msg_id) -> Value: { 'message': Message, 'file_name': str, 'file_size': int, 'is_video': bool, 'mime_type': str, 'timestamp': datetime }
+ORIGINAL_MESSAGES = {}
+MESSAGE_CLEANUP_TIME = 3600  # seconds (1 hour)
+
+async def cleanup_old_messages():
+    """Remove cached message references older than MESSAGE_CLEANUP_TIME."""
+    try:
+        now = datetime.now()
+        to_delete = []
+        for key, data in list(ORIGINAL_MESSAGES.items()):
+            ts = data.get('timestamp')
+            if not ts:
+                continue
+            if (now - ts).total_seconds() > MESSAGE_CLEANUP_TIME:
+                to_delete.append(key)
+        for k in to_delete:
+            ORIGINAL_MESSAGES.pop(k, None)
+        if to_delete:
+            logging.info(f"Cleaned {len(to_delete)} old message references")
+    except Exception as e:
+        logging.error(f"Error in cleanup_old_messages: {e}")
+
 # Usage limits system
 user_usage = defaultdict(lambda: {'daily_bytes': 0, 'last_reset': None, 'last_file_time': None})
 usage_file = "user_usage.json"
@@ -1373,6 +1396,18 @@ async def file_handler(event):
     # Encode chat and message
     msg_id = event.message.id
     chat_id = event.chat_id
+    # Store original message in hybrid cache for reliability
+    storage_key = (chat_id, msg_id)
+    ORIGINAL_MESSAGES[storage_key] = {
+        'message': event.message,
+        'file_name': file_name,
+        'file_size': file_size_bytes,
+        'is_video': is_video,
+        'mime_type': mime_type,
+        'timestamp': datetime.now(),
+    }
+    # Fire-and-forget periodic cleanup
+    asyncio.create_task(cleanup_old_messages())
     buttons = []
     if has_thumbnail:
         buttons.append([Button.inline("🖼️ Add Thumbnail", f"thumb|{chat_id}|{msg_id}")])
@@ -1468,16 +1503,17 @@ async def callback_handler(event):
         msg_id = int(parts[2])
         lock_key = (chat_id, msg_id)
         
-        try:
-            original_msg = await bot.get_messages(chat_id, msg_id)
-            if not original_msg or not original_msg.file:
-                await event.answer("❌ Original file not found!", alert=True)
-                return
-            if original_msg.sender_id != user_id:
-                await event.answer("❌ Not your file!", alert=True)
-                return
-        except Exception:
-            await event.answer("❌ Failed to get original message", alert=True)
+        storage_key = (chat_id, msg_id)
+        stored_data = ORIGINAL_MESSAGES.get(storage_key)
+        if not stored_data:
+            await event.answer("❌ Session expired. Please send the file again.", alert=True)
+            return
+        original_msg = stored_data.get('message')
+        if not original_msg or not getattr(original_msg, 'file', None):
+            await event.answer("❌ Original file not found!", alert=True)
+            return
+        if getattr(original_msg, 'sender_id', None) != user_id:
+            await event.answer("❌ Not your file!", alert=True)
             return
         
         async with PROCESSING_LOCKS.setdefault(lock_key, asyncio.Lock()):
@@ -1492,6 +1528,8 @@ async def callback_handler(event):
                 user_sessions[user_id] = {
                     'action': 'thumb_stateless' if action == 'thumb' else 'rename_stateless',
                     'original_msg': original_msg,
+                    'stored_data': stored_data,
+                    'storage_key': storage_key,
                     'prompt_msg': prompt,
                     'timestamp': datetime.now()
                 }
@@ -1563,11 +1601,17 @@ async def rename_reply_handler(event):
     except Exception as e:
         await event.reply(f"❌ Error: {str(e)}")
     finally:
-        # Clean up prompt message and clear short-lived session
+        # Clean up prompt message, cache entry, and clear short-lived session
         try:
             pm = sess.get('prompt_msg')
             if pm:
                 await pm.delete()
+        except Exception:
+            pass
+        try:
+            storage_key = sess.get('storage_key')
+            if storage_key:
+                ORIGINAL_MESSAGES.pop(storage_key, None)
         except Exception:
             pass
         if user_id in user_sessions:
