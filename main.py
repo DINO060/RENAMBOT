@@ -324,6 +324,54 @@ async def cleanup_old_messages():
     except Exception as e:
         logging.error(f"Error in cleanup_old_messages: {e}")
 
+# =============================
+# Per-user Thumbnail Queue/Worker
+# =============================
+THUMB_QUEUES = {}
+THUMB_WORKERS = {}
+
+class _SimpleEvent:
+    def __init__(self, chat_id, client):
+        self.chat_id = chat_id
+        self.client = client
+    async def reply(self, *args, **kwargs):
+        return await self.client.send_message(self.chat_id, *args, **kwargs)
+
+def ensure_thumb_worker(user_id: int):
+    task = THUMB_WORKERS.get(user_id)
+    if task and not task.done():
+        return
+    q = THUMB_QUEUES.setdefault(user_id, asyncio.Queue())
+    THUMB_WORKERS[user_id] = asyncio.create_task(_thumb_worker(user_id, q))
+
+async def _thumb_worker(user_id: int, q: asyncio.Queue):
+    try:
+        while True:
+            job = await q.get()
+            try:
+                # Build a lightweight event wrapper for progress messages
+                evt = _SimpleEvent(job['chat_id'], bot)
+                await process_with_thumbnail(evt, user_id, job['new_name'], sess=job['sess'])
+                # After successful processing, cleanup cached original message
+                try:
+                    storage_key = (job.get('sess') or {}).get('storage_key')
+                    if storage_key:
+                        ORIGINAL_MESSAGES.pop(storage_key, None)
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    await bot.send_message(job['chat_id'], f"❌ Error in queued thumbnail: {e}", parse_mode='html')
+                except Exception:
+                    pass
+            finally:
+                q.task_done()
+            # If queue becomes empty, stop worker until next enqueue
+            if q.empty():
+                break
+    finally:
+        THUMB_WORKERS.pop(user_id, None)
+
 # Usage limits system
 user_usage = defaultdict(lambda: {'daily_bytes': 0, 'last_reset': None, 'last_file_time': None})
 usage_file = "user_usage.json"
@@ -1599,7 +1647,48 @@ async def rename_reply_handler(event):
                 pass
             
         elif action == 'thumb_stateless':
-            await process_with_thumbnail(event, user_id, new_name, sess=sess)
+            # Build a minimal, self-contained session snapshot for queued processing
+            sess_copy = {
+                'action': 'thumb_stateless',
+                'original_msg': sess.get('original_msg'),
+                'stored_data': sess.get('stored_data'),
+                'storage_key': sess.get('storage_key'),
+                'timestamp': datetime.now(),
+            }
+            # Determine if a worker is already active or queue has items
+            q = THUMB_QUEUES.setdefault(user_id, asyncio.Queue())
+            worker_active = user_id in THUMB_WORKERS and THUMB_WORKERS[user_id] and not THUMB_WORKERS[user_id].done()
+            queue_has_items = not q.empty()
+            if worker_active or queue_has_items:
+                # Enqueue and inform the user it's queued
+                await q.put({
+                    'chat_id': event.chat_id,
+                    'new_name': sanitized_name,
+                    'sess': sess_copy,
+                })
+                ensure_thumb_worker(user_id)
+                await event.reply("🕒 Fichier en attente… Je le traiterai après le fichier actuel.")
+                # Delete prompt now; worker will cleanup the cache after processing
+                try:
+                    pm = sess.get('prompt_msg')
+                    if pm:
+                        await pm.delete()
+                except Exception:
+                    pass
+                # End early; do not fall through to cleanup that removes cache
+                if user_id in user_sessions:
+                    del user_sessions[user_id]
+                return
+            else:
+                # No active job: process immediately (no queue message)
+                await process_with_thumbnail(event, user_id, new_name, sess=sess_copy)
+                # After immediate processing, cleanup cached original message
+                try:
+                    storage_key = sess_copy.get('storage_key')
+                    if storage_key:
+                        ORIGINAL_MESSAGES.pop(storage_key, None)
+                except Exception:
+                    pass
     except Exception as e:
         await event.reply(f"❌ Error: {str(e)}")
     finally:
@@ -1610,10 +1699,12 @@ async def rename_reply_handler(event):
                 await pm.delete()
         except Exception:
             pass
+        # Note: cache cleanup for thumbnail path is handled in worker or after immediate processing above
         try:
-            storage_key = sess.get('storage_key')
-            if storage_key:
-                ORIGINAL_MESSAGES.pop(storage_key, None)
+            if action == 'rename_stateless':
+                storage_key = sess.get('storage_key')
+                if storage_key:
+                    ORIGINAL_MESSAGES.pop(storage_key, None)
         except Exception:
             pass
         if user_id in user_sessions:
