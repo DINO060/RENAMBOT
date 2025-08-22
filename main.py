@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
 from telethon import TelegramClient, events, Button
-from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo, ReplyKeyboardForceReply
 from telethon.errors import FloodWaitError, UserNotParticipantError, ChannelPrivateError
 from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import SendMessageTypingAction, SendMessageUploadDocumentAction
@@ -329,6 +329,7 @@ async def cleanup_old_messages():
 # =============================
 THUMB_QUEUES = {}
 THUMB_WORKERS = {}
+THUMB_USER_LOCKS = defaultdict(asyncio.Lock)
 
 class _SimpleEvent:
     def __init__(self, chat_id, client):
@@ -349,9 +350,12 @@ async def _thumb_worker(user_id: int, q: asyncio.Queue):
         while True:
             job = await q.get()
             try:
-                # Build a lightweight event wrapper for progress messages
-                evt = _SimpleEvent(job['chat_id'], bot)
-                await process_with_thumbnail(evt, user_id, job['new_name'], sess=job['sess'])
+                logging.info(f"[THUMB] Start job for user {user_id}; queue size before start: {q.qsize()} name={job.get('new_name')}")
+                async with THUMB_USER_LOCKS[user_id]:
+                    # Build a lightweight event wrapper for progress messages
+                    evt = _SimpleEvent(job['chat_id'], bot)
+                    await process_with_thumbnail(evt, user_id, job['new_name'], sess=job['sess'])
+                logging.info(f"[THUMB] Finished job for user {user_id}; remaining in queue: {q.qsize()}")
                 # After successful processing, cleanup cached original message
                 try:
                     storage_key = (job.get('sess') or {}).get('storage_key')
@@ -825,13 +829,13 @@ def get_video_dimensions(file_path):
     return None, None
 
 def get_video_attributes(file_path, sanitized_name):
-    """Crée les attributs vidéo optimisés pour le streaming"""
+    """Create optimized video attributes for streaming"""
     duration = get_video_duration(file_path)
     width, height = get_video_dimensions(file_path)
     
-    # Valeurs par défaut si on ne peut pas les obtenir
+    # Default values if we cannot detect them
     if not width or not height:
-        width, height = 1280, 720  # HD par défaut
+        width, height = 1280, 720  # Default HD
     if not duration:
         duration = 0
     
@@ -841,7 +845,7 @@ def get_video_attributes(file_path, sanitized_name):
             duration=duration,
             w=width,
             h=height,
-            supports_streaming=True,  # ✅ CRUCIAL !
+            supports_streaming=True,  # ✅ CRUCIAL!
             round_message=False
         )
     ]
@@ -849,24 +853,24 @@ def get_video_attributes(file_path, sanitized_name):
     return attributes
 
 async def ensure_video_compatibility(file_path, progress_msg=None):
-    """Version optimisée - évite la conversion sauf si absolument nécessaire"""
+    """Optimized version - avoid conversion unless absolutely necessary"""
     
-    # NOUVEAU : Vérifier la taille du fichier
+    # NEW: Check file size
     file_size = os.path.getsize(file_path)
-    if file_size > 100 * 1024 * 1024:  # Si > 100 Mo
-        # Ne PAS convertir les gros fichiers
+    if file_size > 100 * 1024 * 1024:  # If > 100 MB
+        # Do NOT convert large files
         return file_path
     
-    # Le reste du code existant pour les petits fichiers...
-    # Vérifier le codec avec ffprobe
+    # Proceed for smaller files...
+    # Check codec with ffprobe
     if not shutil.which("ffprobe"):
-        return file_path  # Pas de ffprobe, on garde le fichier tel quel
+        return file_path  # No ffprobe, keep the file as-is
     
     try:
         import subprocess
         import json
         
-        # Obtenir les infos du codec
+        # Get codec information
         result = subprocess.run(
             ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', file_path],
             stdout=subprocess.PIPE,
@@ -887,36 +891,37 @@ async def ensure_video_compatibility(file_path, progress_msg=None):
                 elif stream['codec_type'] == 'audio':
                     audio_codec = stream.get('codec_name', '')
             
-            # Si déjà en H264/AAC, pas besoin de convertir
+            # If already H264/AAC, no need to convert
             if video_codec == 'h264' and audio_codec == 'aac':
                 return file_path
             
-            # Sinon, convertir
+            # Otherwise, convert
             if progress_msg:
-                await safe_edit(progress_msg, "🔄 <b>Converting video for better compatibility...</b>", parse_mode='html')
+                await safe_edit(progress_msg, "Converting video for better compatibility...", parse_mode='html')
             
             output_path = file_path.replace('.', '_converted.')
             
-            # Commande FFmpeg optimisée pour Telegram
+            # FFmpeg command optimized for Telegram
             cmd = [
                 'ffmpeg', '-i', file_path,
-                '-c:v', 'libx264',           # Codec vidéo H.264
-                '-c:a', 'aac',               # Codec audio AAC
-                '-preset', 'fast',           # Conversion rapide
-                '-movflags', '+faststart',   # ✅ CRUCIAL pour le streaming !
-                '-y',                        # Écraser si existe
+                '-c:v', 'libx264',           # Video codec H.264
+                '-c:a', 'aac',               # Audio codec AAC
+                '-preset', 'fast',           # Fast conversion
+                '-movflags', '+faststart',   # 
+                '-map', '0:v:0?',
+                '-map', '0:a:0?',
                 output_path
             ]
             
             subprocess.run(cmd, check=True, capture_output=True)
             
-            # Supprimer l'original et retourner le converti
+            # Remove original and return converted
             os.remove(file_path)
             return output_path
             
     except Exception as e:
         logging.warning(f"Video conversion failed: {e}")
-        return file_path  # En cas d'erreur, garder l'original
+        return file_path  # On error, keep the original
 
 async def progress_callback(current, total, event, start_time, progress_msg, action="Downloading", last_update_time=None):
     """Callback to display progress"""
@@ -1571,10 +1576,52 @@ async def callback_handler(event):
                 await event.edit("❌ <b>Cancelled.</b>", parse_mode='html')
                 return
             elif action in ("ren", "thumb"):
-                prompt = await event.edit(
-                    "📝 <b>Reply to this message with the new filename</b>",
-                    parse_mode='html'
-                )
+                # Build prompt message and send a NEW message with ForceReply
+                if action == "thumb":
+                    try:
+                        file_name = stored_data.get('file_name') or getattr(original_msg.file, 'name', 'Unknown')
+                        file_size_bytes = int(stored_data.get('file_size') or 0)
+                        mime_type = stored_data.get('mime_type') or getattr(getattr(original_msg, 'file', None), 'mime_type', 'unknown')
+                        from pathlib import Path as _P
+                        ext = _P(file_name).suffix.lstrip('.').upper() if file_name else ""
+                        size_str = human_readable_size(file_size_bytes)
+                        # stylize B to ʙ to match the requested style
+                        size_str = size_str.replace('B', 'ʙ')
+                        dc_id = None
+                        try:
+                            dc_id = getattr(getattr(getattr(original_msg, 'media', None), 'document', None), 'dc_id', None)
+                        except Exception:
+                            dc_id = None
+                        dc_id = dc_id if dc_id is not None else '-'
+
+                        media_info_text = (
+                            "ᴍᴇᴅɪᴀ ɪɴꜰᴏ\n\n"
+                            f"◈ ꜰɪʟᴇ ɴᴀᴍᴇ: {file_name}\n\n"
+                            f"◈ ᴇxᴛᴇɴꜱɪᴏɴ: {ext}\n"
+                            f"◈ ꜰɪʟᴇ ꜱɪᴢᴇ: {size_str}\n"
+                            f"◈ ᴍɪᴍᴇ ᴛʏᴇᴩ: {mime_type}\n"
+                            f"◈ ᴅᴄ ɪᴅ: {dc_id}\n\n"
+                            "ᴘʟᴇᴀsᴇ ᴇɴᴛᴇʀ ᴛʜᴇ ɴᴇᴡ ғɪʟᴇɴᴀᴍᴇ ᴡɪᴛʜ ᴇxᴛᴇɴsɪᴏɴ ᴀɴᴅ ʀᴇᴘʟʏ ᴛʜɪs ᴍᴇssᴀɢᴇ.."
+                        )
+                    except Exception:
+                        media_info_text = "📝 <b>Reply to this message with the new filename</b>"
+                    prompt = await bot.send_message(
+                        event.chat_id,
+                        media_info_text,
+                        parse_mode='html',
+                        reply_to=original_msg.id,
+                        buttons=Button.force_reply(selective=True)
+                    )
+                else:
+                    basic_prompt = "📝 <b>Reply to this message with the new filename</b>"
+                    prompt = await bot.send_message(
+                        event.chat_id,
+                        basic_prompt,
+                        parse_mode='html',
+                        reply_to=original_msg.id,
+                        buttons=Button.force_reply(selective=True)
+                    )
+
                 user_sessions[user_id] = {
                     'action': 'thumb_stateless' if action == 'thumb' else 'rename_stateless',
                     'original_msg': original_msg,
@@ -1655,40 +1702,31 @@ async def rename_reply_handler(event):
                 'storage_key': sess.get('storage_key'),
                 'timestamp': datetime.now(),
             }
-            # Determine if a worker is already active or queue has items
+            # Always enqueue; the worker will process immediately if this is the only job
             q = THUMB_QUEUES.setdefault(user_id, asyncio.Queue())
             worker_active = user_id in THUMB_WORKERS and THUMB_WORKERS[user_id] and not THUMB_WORKERS[user_id].done()
-            queue_has_items = not q.empty()
-            if worker_active or queue_has_items:
-                # Enqueue and inform the user it's queued
-                await q.put({
-                    'chat_id': event.chat_id,
-                    'new_name': sanitized_name,
-                    'sess': sess_copy,
-                })
-                ensure_thumb_worker(user_id)
-                await event.reply("🕒 Fichier en attente… Je le traiterai après le fichier actuel.")
-                # Delete prompt now; worker will cleanup the cache after processing
-                try:
-                    pm = sess.get('prompt_msg')
-                    if pm:
-                        await pm.delete()
-                except Exception:
-                    pass
-                # End early; do not fall through to cleanup that removes cache
-                if user_id in user_sessions:
-                    del user_sessions[user_id]
-                return
-            else:
-                # No active job: process immediately (no queue message)
-                await process_with_thumbnail(event, user_id, new_name, sess=sess_copy)
-                # After immediate processing, cleanup cached original message
-                try:
-                    storage_key = sess_copy.get('storage_key')
-                    if storage_key:
-                        ORIGINAL_MESSAGES.pop(storage_key, None)
-                except Exception:
-                    pass
+            size_before = q.qsize()
+            await q.put({
+                'chat_id': event.chat_id,
+                'new_name': sanitized_name,
+                'sess': sess_copy,
+            })
+            logging.info(f"[THUMB] Enqueued for user {user_id}; size_before={size_before} now={q.qsize()} name={sanitized_name}")
+            ensure_thumb_worker(user_id)
+            # Inform waiting only if there was already a job or a worker running
+            if worker_active or size_before > 0:
+                await event.reply("🕒 File queued… I will process it after the current file.")
+            # Delete prompt now; worker will cleanup the cache after processing
+            try:
+                pm = sess.get('prompt_msg')
+                if pm:
+                    await pm.delete()
+            except Exception:
+                pass
+            # End early; do not fall through to cleanup that removes cache
+            if user_id in user_sessions:
+                del user_sessions[user_id]
+            return
     except Exception as e:
         await event.reply(f"❌ Error: {str(e)}")
     finally:
@@ -1776,10 +1814,10 @@ async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None
         
         upload_path = temp_path
         
-        # Vérifier/convertir pour compatibilité si c'est une vidéo
+        # Check/convert for compatibility if it's a video
         if is_video:
             temp_path = await ensure_video_compatibility(temp_path, progress_msg)
-            # Créer les attributs optimisés
+            # Create optimized attributes
             video_attributes = get_video_attributes(temp_path, sanitized_name)
         else:
             video_attributes = []
@@ -1819,12 +1857,12 @@ async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None
             parse_mode='html',
             file_name=sanitized_name,
             thumb=thumb_to_use,
-            supports_streaming=True,  # ✅ Toujours True pour les vidéos
-            force_document=True,      # ✅ Toujours True pour forcer le mode document
+            supports_streaming=True,  # ✅ Always True for videos
+            force_document=True,      # ✅ Always True to force document mode
             attributes=file_attributes,
             progress_callback=upload_progress,
             part_size_kb=512,  # Optimized chunks for better performance
-            allow_cache=False  # ✅ Force Telegram à régénérer les previews
+            allow_cache=False  # ✅ Force Telegram to regenerate previews
         )
         
         await progress_msg.delete()
@@ -1958,10 +1996,10 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         # Get the thumbnail
         thumb_path = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
         
-        # Vérifier/convertir pour compatibilité si c'est une vidéo
+        # Check/convert for compatibility if it's a video
         if is_video:
             temp_path = await ensure_video_compatibility(temp_path, progress_msg)
-            # Créer les attributs optimisés
+            # Create optimized attributes
             file_attributes = get_video_attributes(temp_path, sanitized_name)
         else:
             file_attributes = [DocumentAttributeFilename(sanitized_name)]
