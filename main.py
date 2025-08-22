@@ -81,7 +81,9 @@ async def process_large_file_streaming(event, user_id, new_name, sess=None):
     if sess is None and user_id not in user_sessions:
         return
     base_info = sess if sess is not None else user_sessions[user_id]
-    original_msg = base_info['message']
+    original_msg = base_info.get('original_msg') or base_info.get('message')
+    if not original_msg:
+        return
     sanitized_name = sanitize_filename(new_name)
     
     # Apply user preferences (clean tags, custom text)
@@ -1652,7 +1654,9 @@ async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None
         ))
         
         base_info = sess if sess is not None else user_sessions[user_id]
-        original_msg = base_info['message']
+        original_msg = base_info.get('original_msg') or base_info.get('message')
+        if not original_msg:
+            raise Exception("Missing original message in session")
         is_video = base_info.get('is_video', False)
         
         temp_filename = "{}_{}_{}".format(user_id, int(time.time()), uuid.uuid4().hex[:8])
@@ -1804,10 +1808,15 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
 
         # Ensure correct extension is kept/added (crucial for inline playback)
         try:
-            original_name = user_sessions[user_id].get('file_name') or ''
+            if sess is not None:
+                original_name = (sess.get('stored_data') or {}).get('file_name') or ''
+                is_video_src = (sess.get('stored_data') or {}).get('is_video', False)
+            else:
+                original_name = user_sessions[user_id].get('file_name') or ''
+                is_video_src = user_sessions[user_id].get('is_video', False)
             original_ext = os.path.splitext(original_name)[1]
             # Default to .mp4 for videos if extension is missing
-            if not original_ext and user_sessions[user_id].get('is_video', False):
+            if not original_ext and is_video_src:
                 original_ext = '.mp4'
             if original_ext and not sanitized_name.lower().endswith(original_ext.lower()):
                 sanitized_name += original_ext
@@ -1816,9 +1825,14 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         
         progress_msg = await event.reply("🖼️ <b>Processing with thumbnail...</b>", parse_mode='html')
         
-        original_msg = user_sessions[user_id]['message']
-        is_video = user_sessions[user_id].get('is_video', False)
-        file_size = user_sessions[user_id]['file_size']
+        if sess is not None:
+            original_msg = sess.get('original_msg')
+            is_video = (sess.get('stored_data') or {}).get('is_video', False)
+            file_size = (sess.get('stored_data') or {}).get('file_size', 0)
+        else:
+            original_msg = user_sessions[user_id]['message']
+            is_video = user_sessions[user_id].get('is_video', False)
+            file_size = user_sessions[user_id]['file_size']
         
         # Download the file
         temp_filename = f"{user_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
@@ -1876,7 +1890,7 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
             thumb=thumb_path,
             supports_streaming=True,
             # IMPORTANT: send as video (not document) to keep inline player
-            force_document=not user_sessions[user_id].get('is_video', False),
+            force_document=not is_video,
             attributes=file_attributes,
             allow_cache=False
         )
