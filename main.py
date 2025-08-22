@@ -516,6 +516,9 @@ async def delfsub_cmd(event):
 @bot.on(events.NewMessage(pattern=r"/channels$"))
 async def channels_cmd(event):
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     if not is_admin(user_id):
         await event.reply("🚫 Admins only.")
         return
@@ -1017,6 +1020,9 @@ async def check_joined_handler(event):
 async def start_handler(event):
     """Improved handler for the /start command"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     # 🔥 FORCE JOIN CHECK 🔥
     ok, missing = await is_user_in_required_channels(user_id)
@@ -1086,6 +1092,9 @@ Send me any file and I'll help you rename it.
 async def cancel_handler(event):
     """Handler to cancel the current operation"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     if user_id in user_sessions:
         if 'temp_path' in user_sessions[user_id]:
@@ -1101,6 +1110,9 @@ async def cancel_handler(event):
 @bot.on(events.NewMessage(pattern='/status'))
 async def status_handler(event):
     """Enhanced status output similar to uploader bot."""
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     active_sessions = len(PROCESSING_LOCKS)
 
     # Ping
@@ -1168,6 +1180,9 @@ async def status_handler(event):
 async def usage_handler(event):
     """Handler to check user usage"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     # 🔥 FORCE JOIN CHECK 🔥
     ok, missing = await is_user_in_required_channels(user_id)
@@ -1208,6 +1223,9 @@ async def usage_handler(event):
 async def settings_command(event):
     """Handler for the /settings command"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     # 🔥 FORCE JOIN CHECK 🔥
     ok, missing = await is_user_in_required_channels(user_id)
@@ -1257,6 +1275,9 @@ async def show_settings_menu(event):
 async def cleanup_handler(event):
     """Handler to clean up user files (admin only)"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     # Check if user is admin
     admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()] if ADMIN_IDS else []
@@ -1277,6 +1298,9 @@ async def cleanup_handler(event):
 async def setthumb_handler(event):
     """Handler to set a thumbnail"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     # 🔥 FORCE JOIN CHECK 🔥
     ok, missing = await is_user_in_required_channels(user_id)
@@ -1317,6 +1341,9 @@ Send /cancel to abort."""
 async def delthumb_handler(event):
     """Handler to delete the thumbnail"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     # 🔥 FORCE JOIN CHECK 🔥
     ok, missing = await is_user_in_required_channels(user_id)
@@ -1339,6 +1366,9 @@ async def delthumb_handler(event):
 async def showthumb_handler(event):
     """Handler to display the current thumbnail"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     # 🔥 FORCE JOIN CHECK 🔥
     ok, missing = await is_user_in_required_channels(user_id)
@@ -1361,6 +1391,9 @@ async def showthumb_handler(event):
 async def photo_handler(event):
     """Handler for photos (thumbnails)"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     # Check if user is in set_thumbnail mode
     if user_id in user_sessions and user_sessions[user_id].get('action') == 'set_thumbnail':
@@ -1409,6 +1442,9 @@ async def photo_handler(event):
 async def file_handler(event):
     """Stateless handler for files (not photos)"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     # Force-join
     ok, missing = await is_user_in_required_channels(user_id)
@@ -1636,6 +1672,9 @@ async def callback_handler(event):
 async def rename_reply_handler(event):
     """Handle replies for stateless rename flows"""
     user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
     
     if user_id not in user_sessions:
         return
