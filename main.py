@@ -1371,37 +1371,8 @@ async def message_handler(event):
         await show_settings_menu(event)
         return
     
-    # Load preferences if necessary
-    if user_id not in sessions:
-        sessions[user_id] = {}
-    
-    custom_text = sessions.get(user_id, {}).get('custom_text', '')
-    text_position = sessions.get(user_id, {}).get('text_position', 'end')
-    clean_tags = sessions.get(user_id, {}).get('clean_tags', True)
-    
-    text = "⚙️ <b>Bot Settings</b>\n\n"
-    
-    if custom_text:
-        text += f"📝 Custom text: <code>{custom_text}</code>\n"
-        text += f"📍 Position: {text_position}\n"
-    else:
-        text += "📝 No custom text set\n"
-    
-    text += f"🧹 Auto-clean tags: {'Yes' if clean_tags else 'No'}\n\n"
-    text += "Choose an option:"
-    
-    keyboard = [
-        [Button.inline("➕ Add/Edit Custom Text", "add_custom_text")],
-        [Button.inline("📍 Change Position", "change_text_position")],
-        [Button.inline("🗑️ Remove Custom Text", "remove_custom_text")],
-        [Button.inline("🧹 Toggle Clean Tags", "toggle_clean_tags")],
-        [Button.inline("❌ Close", "close_settings")]
-    ]
-    
-    if isinstance(event, events.NewMessage.Event):
-        await event.reply(text, parse_mode='html', buttons=keyboard)
-    else:
-        await event.edit(text, parse_mode='html', buttons=keyboard)
+    # For any other message, show the settings menu
+    await show_settings_menu(event)
 
 @bot.on(events.NewMessage(pattern='/cleanup'))
 async def cleanup_handler(event):
