@@ -1347,6 +1347,7 @@ async def message_handler(event):
         return
     
     user_id = event.sender_id
+    message_text = event.raw_text.strip()
     
     # Check if user is in a session awaiting custom text
     if user_id in sessions and sessions[user_id].get('awaiting_custom_text'):
@@ -1354,13 +1355,13 @@ async def message_handler(event):
         sessions[user_id].pop('awaiting_custom_text', None)
         
         # Check if this is a cancel command
-        if event.raw_text.strip().lower() == '/cancel':
+        if message_text.lower() == '/cancel':
             await event.reply("❌ Custom text addition cancelled.", parse_mode='html')
             await show_settings_menu(event)
             return
             
         # Save the custom text
-        custom_text = event.raw_text.strip()
+        custom_text = message_text
         if user_id not in sessions:
             sessions[user_id] = {}
         sessions[user_id]['custom_text'] = custom_text
@@ -1371,8 +1372,11 @@ async def message_handler(event):
         await show_settings_menu(event)
         return
     
-    # For any other message, show the settings menu
-    await show_settings_menu(event)
+    # Only process /settings command
+    if message_text.lower() == '/settings':
+        await show_settings_menu(event)
+    
+    # For other messages, do nothing (or handle them as needed)
 
 @bot.on(events.NewMessage(pattern='/cleanup'))
 async def cleanup_handler(event):
