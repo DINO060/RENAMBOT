@@ -1308,6 +1308,37 @@ async def show_settings_menu(event):
     """Displays the settings menu"""
     user_id = event.sender_id if hasattr(event, 'sender_id') else event.query.user_id
     
+@bot.on(events.NewMessage())
+async def message_handler(event):
+    # Only handle private messages
+    if not event.is_private:
+        return
+    
+    user_id = event.sender_id
+    
+    # Check if user is in a session awaiting custom text
+    if user_id in sessions and sessions[user_id].get('awaiting_custom_text'):
+        # Remove the awaiting flag
+        sessions[user_id].pop('awaiting_custom_text', None)
+        
+        # Check if this is a cancel command
+        if event.raw_text.strip().lower() == '/cancel':
+            await event.reply("❌ Custom text addition cancelled.", parse_mode='html')
+            await show_settings_menu(event)
+            return
+            
+        # Save the custom text
+        custom_text = event.raw_text.strip()
+        if user_id not in sessions:
+            sessions[user_id] = {}
+        sessions[user_id]['custom_text'] = custom_text
+        save_user_preferences()
+        
+        # Confirm and show settings menu
+        await event.reply(f"✅ Custom text set to: <code>{custom_text}</code>", parse_mode='html')
+        await show_settings_menu(event)
+        return
+    
     # Load preferences if necessary
     if user_id not in sessions:
         sessions[user_id] = {}
