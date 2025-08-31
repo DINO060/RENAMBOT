@@ -1308,6 +1308,38 @@ async def show_settings_menu(event):
     """Displays the settings menu"""
     user_id = event.sender_id if hasattr(event, 'sender_id') else event.query.user_id
     
+    # Load preferences if necessary
+    if user_id not in sessions:
+        sessions[user_id] = {}
+    
+    custom_text = sessions.get(user_id, {}).get('custom_text', '')
+    text_position = sessions.get(user_id, {}).get('text_position', 'end')
+    clean_tags = sessions.get(user_id, {}).get('clean_tags', True)
+    
+    text = "⚙️ <b>Bot Settings</b>\n\n"
+    
+    if custom_text:
+        text += f"📝 Custom text: <code>{custom_text}</code>\n"
+        text += f"📍 Position: {text_position}\n"
+    else:
+        text += "📝 No custom text set\n"
+    
+    text += f"🧹 Auto-clean tags: {'Yes' if clean_tags else 'No'}\n\n"
+    text += "Choose an option:"
+    
+    keyboard = [
+        [Button.inline("➕ Add/Edit Custom Text", "add_custom_text")],
+        [Button.inline("📍 Change Position", "change_text_position")],
+        [Button.inline("🗑️ Remove Custom Text", "remove_custom_text")],
+        [Button.inline("🧹 Toggle Clean Tags", "toggle_clean_tags")],
+        [Button.inline("❌ Close", "close_settings")]
+    ]
+    
+    if isinstance(event, events.NewMessage.Event):
+        await event.reply(text, parse_mode='html', buttons=keyboard)
+    else:
+        await event.edit(text, parse_mode='html', buttons=keyboard)
+
 @bot.on(events.NewMessage())
 async def message_handler(event):
     # Only handle private messages
