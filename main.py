@@ -21,6 +21,16 @@ from telethon.tl.types import SendMessageTypingAction, SendMessageUploadDocument
 from telethon.tl.functions.channels import GetParticipantRequest
 import logging
 
+from dotenv import load_dotenv
+
+# Load environment variables from .env if present
+load_dotenv()
+
+# Upload queue and worker system
+UPLOAD_QUEUE = asyncio.Queue()
+UPLOAD_SEMAPHORE = asyncio.Semaphore(1)  # 1 upload at a time
+LAST_UPLOAD_TIME = {}  # Anti-spam tracking
+
 # Import configuration
 def get_env_or_config(attr, default=None):
     value = os.environ.get(attr)
@@ -40,8 +50,59 @@ TOKEN = get_env_or_config("TOKEN")
 ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
 START_TIME = datetime.now(timezone.utc)
 
+# FloodWait handler function
+async def safe_send_file(client, chat_id, file, **kwargs):
+    """Send file with automatic FloodWait handling"""
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            return await client.send_file(chat_id, file, **kwargs)
+        except FloodWaitError as e:
+            wait_time = min(e.seconds, 300)  # Max 5 minutes
+            logging.warning(f"FloodWait: waiting {wait_time}s")
+            await asyncio.sleep(wait_time)
+            retry_count += 1
+        except Exception as e:
+            logging.error(f"Error sending file: {e}")
+            await asyncio.sleep(2)
+            retry_count += 1
+    
+    raise Exception("Failed after 3 attempts")
 
+# Upload worker to process queue
+async def upload_worker():
+    """Worker that processes uploads sequentially"""
+    while True:
+        job = await UPLOAD_QUEUE.get()
+        try:
+            async with UPLOAD_SEMAPHORE:
+                await job['func'](**job['kwargs'])
+        except Exception as e:
+            logging.error(f"Error in upload_worker: {e}")
+            try:
+                await bot.send_message(
+                    job['user_id'], 
+                    f"❌ Error during upload: {str(e)}"
+                )
+            except:
+                pass
+        finally:
+            UPLOAD_QUEUE.task_done()
 
+# Anti-spam cooldown check
+async def check_upload_cooldown(user_id):
+    """Check cooldown between uploads"""
+    now = time.time()
+    last_time = LAST_UPLOAD_TIME.get(user_id, 0)
+    
+    if now - last_time < COOLDOWN_SECONDS:
+        remaining = COOLDOWN_SECONDS - (now - last_time)
+        return False, remaining
+    
+    LAST_UPLOAD_TIME[user_id] = now
+    return True, 0
 
 async def safe_edit(msg_obj, new_text, **kwargs):
     """
@@ -107,7 +168,8 @@ async def process_large_file_streaming(event, user_id, new_name, sess=None):
     logging.info(f"[RenameOnly] Resending media for user {user_id}: name='{sanitized_name}', is_video={is_video}, force_document={force_document}")
     
     try:
-        await event.client.send_file(
+        await safe_send_file(
+            event.client,
             event.chat_id,
             original_msg.media,
             caption=caption,
@@ -512,6 +574,11 @@ async def delfsub_cmd(event):
     else:
         await event.reply("✅ No forced-sub channels configured.")
 
+
+@bot.on(events.NewMessage(pattern='/ping'))
+async def ping_handler(event):
+    """Test to see if bot responds"""
+    await event.reply("🏓 Pong! Bot active.")
 
 @bot.on(events.NewMessage(pattern=r"/channels$"))
 async def channels_cmd(event):
@@ -927,7 +994,7 @@ async def ensure_video_compatibility(file_path, progress_msg=None):
         return file_path  # On error, keep the original
 
 async def progress_callback(current, total, event, start_time, progress_msg, action="Downloading", last_update_time=None):
-    """Callback to display progress"""
+    """Callback to display progress with styled format"""
     now = time.time()
     
     # Avoid too frequent updates
@@ -946,33 +1013,35 @@ async def progress_callback(current, total, event, start_time, progress_msg, act
     speed = current / diff
     time_to_completion = round((total - current) / speed) if speed > 0 else 0
     
-    progress_bar_length = 10
-    completed_length = int(percentage / 10)
-    progress_bar = '▓' * completed_length + '░' * (progress_bar_length - completed_length)
+    # Convert ETA to minutes and seconds
+    eta_mins = time_to_completion // 60
+    eta_secs = time_to_completion % 60
+    if eta_mins > 0:
+        eta_str = f"{eta_mins}m {eta_secs}s"
+    else:
+        eta_str = f"{eta_secs}s"
     
-    text = """<b>{} File...</b>
+    # Create progress bar with circles (20 positions)
+    progress_bar_length = 20
+    completed_length = int(percentage / 5)  # Each circle = 5%
+    progress_bar = '●' * completed_length + '○' * (progress_bar_length - completed_length)
+    
+    # Style the text labels
+    text = f"""{action}..
 
-<code>{}</code> {:.1f}%
+[{progress_bar}]
 
-📊 <b>Progress:</b> {} / {}
-⚡ <b>Speed:</b> {}/s
-⏱ <b>ETA:</b> {}s
-""".format(
-        action,
-        progress_bar,
-        percentage,
-        human_readable_size(current),
-        human_readable_size(total),
-        human_readable_size(speed),
-        time_to_completion
-    )
+» Sɪᴢᴇ : {human_readable_size(current)} | {human_readable_size(total)}
+» Dᴏɴᴇ : {percentage:.2f}%
+» Sᴘᴇᴇᴅ : {human_readable_size(speed)}/s
+» ETA : {eta_str}"""
     
     # Avoid redundant edits by checking the last text
     if hasattr(progress_msg, '_last_progress_text') and progress_msg._last_progress_text == text:
         return
     
     try:
-        await safe_edit(progress_msg, text, parse_mode='html')
+        await safe_edit(progress_msg, text, parse_mode=None)  # No parse_mode for plain text
         # Store the last sent text
         progress_msg._last_progress_text = text
     except FloodWaitError as e:
@@ -1716,7 +1785,8 @@ async def rename_reply_handler(event):
     
     try:
         if action == 'rename_stateless':
-            await bot.send_file(
+            await safe_send_file(
+                bot,
                 event.chat_id,
                 original_msg.media,
                 caption=f"<code>{sanitized_name}</code>",
@@ -1810,11 +1880,11 @@ async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None
         if custom_text:
             sanitized_name = add_custom_text_to_filename(sanitized_name, custom_text, text_position)
         
-        # Progress message
+        # Initial progress message
         if isinstance(event, events.CallbackQuery.Event):
-             progress_msg = await event.edit("⏳ <b>Processing...</b>", parse_mode='html')
+             progress_msg = await event.edit("Processing...", parse_mode=None)
         else:
-             progress_msg = await event.reply("⏳ <b>Processing...</b>", parse_mode='html')
+             progress_msg = await event.reply("Processing...", parse_mode=None)
 
         await bot(SetTypingRequest(
             event.chat_id, 
@@ -1864,7 +1934,7 @@ async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None
         # SKIP FFmpeg - not necessary for simple renaming
         # Optimization disabled to improve performance
         
-        await safe_edit(progress_msg, "📤 <b>Uploading file...</b>", parse_mode='html')
+        await safe_edit(progress_msg, "Preparing upload...", parse_mode=None)
         
         start_time = time.time()
         last_update_time_upload = [start_time]
@@ -1889,7 +1959,8 @@ async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None
         caption = f"<code>{sanitized_name}</code>"
         
         # Send file with all necessary attributes
-        await event.client.send_file(
+        await safe_send_file(
+            event.client,
             event.chat_id,
             upload_path,
             caption=caption,  # Caption with filename
@@ -1950,6 +2021,33 @@ async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None
 
 
 
+async def process_with_thumbnail_queued(event, user_id, new_name, sess=None):
+    """Queue wrapper for process_with_thumbnail"""
+    # Check cooldown first
+    can_upload, remaining = await check_upload_cooldown(user_id)
+    if not can_upload:
+        await event.reply(f"⏳ Please wait {int(remaining)} seconds before the next file")
+        return
+    
+    # Add to queue
+    await UPLOAD_QUEUE.put({
+        'func': process_with_thumbnail,
+        'kwargs': {
+            'event': event,
+            'user_id': user_id,
+            'new_name': new_name,
+            'sess': sess
+        },
+        'user_id': user_id
+    })
+    
+    queue_size = UPLOAD_QUEUE.qsize()
+    if queue_size > 0:
+        await event.reply(
+            f"📋 File added to queue (position: {queue_size})\n"
+            f"Processing after current uploads..."
+        )
+
 async def process_with_thumbnail(event, user_id, new_name, sess=None):
     """Processes the file with thumbnail and new name"""
     
@@ -1991,7 +2089,7 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         except Exception:
             pass
         
-        progress_msg = await event.reply("🖼️ <b>Processing with thumbnail...</b>", parse_mode='html')
+        progress_msg = await event.reply("Processing with thumbnail...", parse_mode=None)
         
         if sess is not None:
             original_msg = sess.get('original_msg')
@@ -2006,20 +2104,11 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         temp_filename = f"{user_id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         temp_path = os.path.join(TEMP_DIR, temp_filename)
         
-        await safe_edit(progress_msg, "📥 <b>Downloading file...</b>", parse_mode='html')
-        
         start_time = time.time()
+        last_update_time = [start_time]
+        
         async def download_progress(current, total):
-            if time.time() - start_time > 2:
-                percentage = current * 100 / total
-                text = f"📥 <b>Downloading...</b> {percentage:.1f}%"
-                
-                # Avoid redundant edits
-                if hasattr(progress_msg, '_last_progress_text') and progress_msg._last_progress_text == text:
-                    return
-                
-                await safe_edit(progress_msg, text, parse_mode='html')
-                progress_msg._last_progress_text = text
+            await progress_callback(current, total, event, start_time, progress_msg, "Downloading", last_update_time)
         
         path = await original_msg.download_media(
             file=temp_path,
@@ -2046,10 +2135,17 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         # Minimal caption (just the name like rename_only)
         caption = f"<code>{sanitized_name}</code>"
         
-        await safe_edit(progress_msg, "📤 <b>Uploading with thumbnail...</b>", parse_mode='html')
+        await safe_edit(progress_msg, "Preparing upload with thumbnail...", parse_mode=None)
+        
+        start_time = time.time()
+        last_update_time_upload = [start_time]
+        
+        async def upload_progress(current, total):
+            await progress_callback(current, total, event, start_time, progress_msg, "Uploading", last_update_time_upload)
         
         # Send with thumbnail
-        await event.client.send_file(
+        await safe_send_file(
+            event.client,
             event.chat_id,
             temp_path,
             caption=caption,
@@ -2060,6 +2156,7 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
             # IMPORTANT: send as video (not document) to keep inline player
             force_document=not is_video,
             attributes=file_attributes,
+            progress_callback=upload_progress,
             allow_cache=False
         )
         
@@ -2095,7 +2192,7 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
             del user_sessions[user_id]
         
     except Exception as e:
-        error_msg = f"❌ <b>Error:</b> {str(e)}"
+        error_msg = f"❌ Error: {str(e)}"
         if progress_msg:
             await safe_edit(progress_msg, error_msg, parse_mode='html')
         else:
@@ -2126,15 +2223,16 @@ def main():
     """Main function modified"""
     print("🤖 Bot started successfully!")
     print("📁 Temp directory: {}".format(TEMP_DIR))
-    print("📊 Max file size: {}".format(human_readable_size(MAX_FILE_SIZE)))
-    print("🎬 FFmpeg: {}".format("Available" if shutil.which("ffmpeg") else "Not available"))
-    print("📈 Daily limit: {} per user".format(human_readable_size(DAILY_LIMIT_BYTES)))
-    print("⏱ Cooldown: {} seconds between files".format(COOLDOWN_SECONDS))
-    print("⚡ Fast thumbnail mode: ENABLED")
-    print(f"📢 Force Join Channel: @{FORCE_JOIN_CHANNEL}")
+    print("🖼️ Thumbnail directory: {}".format(THUMBNAIL_DIR))
+    print(f"📂 Download directory: {DOWNLOAD_DIR}")
+    print(f"👥 Admin IDs: {ADMIN_SET}")
+    print(f"🕒 Bot started at: {START_TIME}")
     
-    # Load data
-    load_user_usage()
+    # Start upload worker for queue processing
+    bot.loop.create_task(upload_worker())
+    # Start auto cleanup task
+    bot.loop.create_task(auto_cleanup_task())
+    # Load preferences
     load_user_preferences()
     print("📊 User data loaded")
     

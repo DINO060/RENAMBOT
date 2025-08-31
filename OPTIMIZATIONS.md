@@ -1,148 +1,148 @@
-# ⚡ Optimisations du Bot Telegram - Gains de Performance
+# ⚡ Telegram Bot Optimizations - Performance Gains
 
-## 🚀 **Améliorations Critiques Implémentées**
+## 🚀 **Critical Improvements Implemented**
 
-### 1. **Upload Direct pour Thumbnails (Gain: 85-90%)**
-**Problème identifié :** Le bot téléchargeait TOUT le fichier (130MB) puis le re-uploadait pour juste ajouter un thumbnail.
+### 1. **Direct Upload for Thumbnails (Gain: 85-90%)**
+**Identified Problem:** The bot was downloading the ENTIRE file (130MB) then re-uploading it just to add a thumbnail.
 
-**Solution :** Upload direct avec `original_msg.media`
+**Solution:** Direct upload with `original_msg.media`
 ```python
-# AVANT (3-8 minutes)
-await process_file(event, user_id, use_thumb=True)  # Télécharge tout
+# BEFORE (3-8 minutes)
+await process_file(event, user_id, use_thumb=True)  # Downloads everything
 
-# APRÈS (30-45 secondes)
+# AFTER (30-45 seconds)
 await bot.send_file(
     event.chat_id,
-    original_msg.media,  # Utilise directement le média original
+    original_msg.media,  # Uses original media directly
     file_name=sanitized_name,
     thumb=thumb_path,
     part_size_kb=512
 )
 ```
 
-### 2. **Désactivation FFmpeg Inutile**
-**Problème :** FFmpeg réencodait les vidéos même pour juste ajouter un thumbnail.
+### 2. **Disable Unnecessary FFmpeg**
+**Problem:** FFmpeg was re-encoding videos even just to add a thumbnail.
 
-**Solution :** Suppression du bloc FFmpeg pour les thumbnails
+**Solution:** Remove FFmpeg block for thumbnails
 ```python
-# SUPPRIMÉ
+# REMOVED
 if is_video and use_thumb and shutil.which("ffmpeg"):
-    # Processus FFmpeg inutile - 2-3 minutes de perdues
+    # Unnecessary FFmpeg process - 2-3 minutes wasted
 ```
 
-### 3. **Optimisation des Chunks Upload**
-**Ajout :** `part_size_kb=512` pour tous les uploads
+### 3. **Upload Chunk Optimization**
+**Added:** `part_size_kb=512` for all uploads
 ```python
 await bot.send_file(
-    # ... autres paramètres
-    part_size_kb=512  # Chunks optimisés
+    # ... other parameters
+    part_size_kb=512  # Optimized chunks
 )
 ```
 
-## 📊 **Benchmarks de Performance**
+## 📊 **Performance Benchmarks**
 
-| Opération | Avant | Après | Gain |
+| Operation | Before | After | Gain |
 |-----------|-------|-------|------|
 | Thumbnail 50MB | 2-3 min | 15-30s | **85%** |
 | Thumbnail 130MB | 3-5 min | 30-45s | **87%** |
 | Thumbnail 200MB | 6-8 min | 45-60s | **89%** |
-| Renommage simple | 1-2 min | 30-60s | **70%** |
+| Simple rename | 1-2 min | 30-60s | **70%** |
 
-## ✨ **Nouvelles Fonctionnalités**
+## ✨ **New Features**
 
-### 1. **Système de Texte Personnalisé**
-- Ajout automatique de @username ou texte custom
-- Position flexible (début/fin du nom)
-- Nettoyage automatique des anciens tags
-- Sauvegarde persistante des préférences
+### 1. **Custom Text System**
+- Automatic addition of @username or custom text
+- Flexible position (beginning/end of name)
+- Automatic cleanup of old tags
+- Persistent preference saving
 
-### 2. **Menu Settings Intuitif**
-- Bouton "⚙️ Settings" dans /start
-- Interface avec boutons inline
-- Configuration en temps réel
-- Sauvegarde automatique
+### 2. **Intuitive Settings Menu**
+- "⚙️ Settings" button in /start
+- Interface with inline buttons
+- Real-time configuration
+- Automatic saving
 
-### 3. **Nettoyage Intelligent**
-- Suppression automatique des @tags et #hashtags
-- Option activable/désactivable
-- Préservation des thumbnails
-- Nettoyage silencieux
+### 3. **Smart Cleanup**
+- Automatic removal of @tags and #hashtags
+- Enable/disable option
+- Thumbnail preservation
+- Silent cleanup
 
-## 🔧 **Configuration Optimale**
+## 🔧 **Optimal Configuration**
 
-### Variables de Performance
+### Performance Variables
 ```python
-UPLOAD_CHUNK_SIZE = 512  # KB - Optimisé pour PC local
+UPLOAD_CHUNK_SIZE = 512  # KB - Optimized for local PC
 DOWNLOAD_CHUNK_SIZE = 1024  # KB
-SKIP_FFMPEG_FOR_THUMB = True  # Désactive FFmpeg inutile
-USE_FAST_THUMBNAIL = True  # Active l'upload direct
+SKIP_FFMPEG_FOR_THUMB = True  # Disable unnecessary FFmpeg
+USE_FAST_THUMBNAIL = True  # Enable direct upload
 ```
 
-### Fichiers de Données
-- `user_usage.json` : Limites d'utilisation
-- `user_preferences.json` : Préférences utilisateur
-- `temp_files/` : Fichiers temporaires
-- `thumbnails/` : Miniatures personnalisées
+### Data Files
+- `user_usage.json` : Usage limits
+- `user_preferences.json` : User preferences
+- `temp_files/` : Temporary files
+- `thumbnails/` : Custom thumbnails
 
-## 🎮 **Utilisation Optimisée**
+## 🎮 **Optimized Usage**
 
-### Workflow Recommandé
-1. **/start** → Bouton "⚙️ Settings"
-2. **Configurer** le texte personnalisé (ex: @mychannel)
-3. **Envoyer** un fichier → Le texte s'ajoute automatiquement
-4. **"Add Thumbnail"** → Upload en 30 secondes !
+### Recommended Workflow
+1. **/start** → "⚙️ Settings" button
+2. **Configure** custom text (ex: @mychannel)
+3. **Send** a file → Text adds automatically
+4. **"Add Thumbnail"** → Upload in 30 seconds!
 
-### Commandes Rapides
-- `/settings` : Menu de configuration
-- `/usage` : Vérifier les limites
-- `/setthumb` : Définir une miniature
-- `/cancel` : Annuler l'opération
+### Quick Commands
+- `/settings` : Configuration menu
+- `/usage` : Check limits
+- `/setthumb` : Set thumbnail
+- `/cancel` : Cancel operation
 
-## 🛡️ **Sécurité et Stabilité**
+## 🛡️ **Security and Stability**
 
-### Protection contre les Abus
-- Limite de 1GB par jour par utilisateur
-- Cooldown de 30 secondes entre fichiers
-- Vérification des limites avant traitement
+### Abuse Protection
+- 1GB daily limit per user
+- 30-second cooldown between files
+- Limit verification before processing
 
-### Gestion des Erreurs
-- Logging détaillé des opérations
-- Récupération automatique en cas d'erreur
-- Nettoyage en cas de crash
+### Error Handling
+- Detailed operation logging
+- Automatic error recovery
+- Cleanup on crash
 
-## 📈 **Métriques de Performance**
+## 📈 **Performance Metrics**
 
-### Avant les Optimisations
-- ❌ 3-8 minutes pour un thumbnail 130MB
-- ❌ Téléchargement complet inutile
-- ❌ FFmpeg pour tout
-- ❌ Pas de texte personnalisé
+### Before Optimizations
+- ❌ 3-8 minutes for 130MB thumbnail
+- ❌ Unnecessary complete download
+- ❌ FFmpeg for everything
+- ❌ No custom text
 
-### Après les Optimisations
-- ✅ 30-45 secondes pour un thumbnail 130MB
-- ✅ Upload direct sans téléchargement
-- ✅ FFmpeg désactivé pour thumbnails
-- ✅ Texte personnalisé automatique
-- ✅ Interface utilisateur intuitive
+### After Optimizations
+- ✅ 30-45 seconds for 130MB thumbnail
+- ✅ Direct upload without download
+- ✅ FFmpeg disabled for thumbnails
+- ✅ Automatic custom text
+- ✅ Intuitive user interface
 
-## 🚨 **Points d'Attention**
+## 🚨 **Points of Attention**
 
 ### Limitations
-- Upload direct fonctionne seulement pour les thumbnails
-- Renommage simple nécessite encore le téléchargement
-- FFmpeg désactivé pour les thumbnails (performance > qualité)
+- Direct upload works only for thumbnails
+- Simple rename still requires download
+- FFmpeg disabled for thumbnails (performance > quality)
 
-### Recommandations
-- Utiliser des thumbnails de 200KB maximum
-- Configurer le texte personnalisé une fois
-- Surveiller l'utilisation quotidienne
+### Recommendations
+- Use thumbnails of 200KB maximum
+- Configure custom text once
+- Monitor daily usage
 
-## 🎉 **Résultat Final**
+## 🎉 **Final Result**
 
-**Amélioration globale : 85-90% de gain en vitesse !**
+**Overall improvement: 85-90% speed gain!**
 
-Le bot est maintenant **production-ready** avec :
-- ⚡ Performance optimale
-- 🎯 Fonctionnalités avancées
-- 🛡️ Sécurité renforcée
-- 📱 Interface intuitive 
+The bot is now **production-ready** with:
+- ⚡ Optimal performance
+- 🎯 Advanced features
+- 🛡️ Enhanced security
+- 📱 Intuitive interface 

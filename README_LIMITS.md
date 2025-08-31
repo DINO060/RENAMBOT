@@ -1,114 +1,114 @@
-# 🎯 Système de Limites et Nettoyage Automatique
+# 🎯 Limits System and Automatic Cleanup
 
-## 📊 Limites d'Utilisation
+## 📊 Usage Limits
 
-### Limite Quotidienne
-- **1 GB par jour** par utilisateur
-- Reset automatique à minuit (00:00)
-- Suivi en temps réel de l'utilisation
+### Daily Limit
+- **1 GB per day** per user
+- Automatic reset at midnight (00:00)
+- Real-time usage tracking
 
-### Délai entre Fichiers
-- **30 secondes** de cooldown entre chaque fichier
-- Évite le spam et protège les ressources
+### Delay Between Files
+- **30 seconds** cooldown between each file
+- Prevents spam and protects resources
 
-## 🔧 Nouvelles Commandes
+## 🔧 New Commands
 
 ### `/usage`
-Affiche les statistiques d'utilisation de l'utilisateur :
-- Utilisation quotidienne actuelle
-- Limite restante
-- Barre de progression visuelle
-- Prochain reset
+Displays user usage statistics:
+- Current daily usage
+- Remaining limit
+- Visual progress bar
+- Next reset
 
-### `/cleanup` (Admin seulement)
-Nettoie tous les fichiers d'un utilisateur :
-- Supprime les fichiers temporaires
-- Préserve les thumbnails
-- Nettoyage des sessions
+### `/cleanup` (Admin only)
+Cleans all user files:
+- Removes temporary files
+- Preserves thumbnails
+- Session cleanup
 
-## 🗂️ Gestion des Fichiers
+## 🗂️ File Management
 
-### Nettoyage Automatique
-- **Toutes les heures** : Nettoyage des fichiers orphelins
-- **Après chaque 1GB** : Nettoyage silencieux des fichiers utilisateur
-- **Sessions expirées** : Nettoyage automatique après 10 minutes
+### Automatic Cleanup
+- **Every hour**: Orphaned file cleanup
+- **After each 1GB**: Silent user file cleanup
+- **Expired sessions**: Automatic cleanup after 10 minutes
 
-### Fichiers Préservés
-- ✅ Thumbnails personnalisés
-- ✅ Données d'utilisation
-- ✅ Sessions actives
+### Preserved Files
+- ✅ Custom thumbnails
+- ✅ Usage data
+- ✅ Active sessions
 
-### Fichiers Supprimés
-- ❌ Fichiers temporaires orphelins (>1 heure)
-- ❌ Sessions expirées
-- ❌ Fichiers de traitement terminés
+### Deleted Files
+- ❌ Orphaned temporary files (>1 hour)
+- ❌ Expired sessions
+- ❌ Completed processing files
 
-## 📈 Suivi d'Utilisation
+## 📈 Usage Tracking
 
-### Stockage
-- Données sauvegardées dans `user_usage.json`
-- Persistance entre les redémarrages
-- Format JSON lisible
+### Storage
+- Data saved in `user_usage.json`
+- Persistence between restarts
+- Readable JSON format
 
-### Métriques
-- Taille totale utilisée par jour
-- Nombre de fichiers traités
-- Dernière activité
-- Historique des resets
+### Metrics
+- Total size used per day
+- Number of files processed
+- Last activity
+- Reset history
 
-## 🛡️ Sécurité
+## 🛡️ Security
 
-### Protection contre les Abus
-- Limite de débit par utilisateur
-- Vérification des limites avant traitement
-- Messages d'erreur informatifs
+### Abuse Protection
+- Rate limiting per user
+- Limit verification before processing
+- Informative error messages
 
-### Gestion des Erreurs
-- Logging détaillé des opérations
-- Récupération automatique en cas d'erreur
-- Nettoyage en cas de crash
+### Error Handling
+- Detailed operation logging
+- Automatic error recovery
+- Cleanup on crash
 
 ## ⚙️ Configuration
 
-### Variables Modifiables
+### Modifiable Variables
 ```python
-DAILY_LIMIT_GB = 1  # Limite quotidienne en GB
-COOLDOWN_SECONDS = 30  # Délai entre fichiers
-USER_TIMEOUT = 600  # Timeout session (10 min)
+DAILY_LIMIT_GB = 1  # Daily limit in GB
+COOLDOWN_SECONDS = 30  # Delay between files
+USER_TIMEOUT = 600  # Session timeout (10 min)
 ```
 
-### Fichiers de Données
-- `user_usage.json` : Données d'utilisation
-- `temp_files/` : Fichiers temporaires
-- `thumbnails/` : Miniatures utilisateur
+### Data Files
+- `user_usage.json` : Usage data
+- `temp_files/` : Temporary files
+- `thumbnails/` : User thumbnails
 
-## 🚀 Utilisation
+## 🚀 Usage
 
-1. **Envoi de fichier** : Vérification automatique des limites
-2. **Traitement** : Mise à jour de l'utilisation après succès
-3. **Nettoyage** : Suppression automatique des fichiers temporaires
-4. **Suivi** : Commande `/usage` pour vérifier les limites
+1. **File upload**: Automatic limit verification
+2. **Processing**: Usage update after success
+3. **Cleanup**: Automatic temporary file removal
+4. **Tracking**: `/usage` command to check limits
 
 ## 📝 Logs
 
-Le système génère des logs détaillés :
-- Mise à jour de l'utilisation
-- Nettoyage automatique
-- Erreurs de limites
-- Suppression de fichiers
+The system generates detailed logs:
+- Usage updates
+- Automatic cleanup
+- Limit errors
+- File deletion
 
 ## 🔄 Maintenance
 
-### Nettoyage Manuel
+### Manual Cleanup
 ```bash
-# Supprimer tous les fichiers temporaires
+# Remove all temporary files
 rm -rf temp_files/*
 
-# Supprimer les données d'utilisation
+# Remove usage data
 rm user_usage.json
 ```
 
-### Surveillance
-- Vérifier l'espace disque
-- Monitorer les logs d'erreur
-- Contrôler l'utilisation par utilisateur 
+### Monitoring
+- Check disk space
+- Monitor error logs
+- Control usage per user 
