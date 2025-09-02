@@ -608,25 +608,31 @@ def clean_filename_text(text):
     return text.strip()
 
 def add_custom_text_to_filename(filename, custom_text=None, position='end'):
-    """Adds a custom text to the filename"""
+    """Adds a custom text to the filename without duplicating emojis or brackets"""
     if not custom_text:
         return filename
-    
+
     name, ext = os.path.splitext(filename)
-    
-    # Clean up the existing name first
+
+    # Nettoyer le nom du fichier SANS toucher aux emojis ou crochets
     name = clean_filename_text(name)
-    
-    # Add custom text
-    if position == 'end':
-        name = f"{name} {custom_text}"
-    else:  # start
-        name = f"{custom_text} {name}"
-    
-    # Clean up multiple spaces
-    name = re.sub(r'\s+', ' ', name).strip()
-    
-    return f"{name}{ext}"
+
+    # NE PAS nettoyer custom_text, juste strip pour éviter les espaces
+    custom_text = custom_text.strip()
+
+    # Vérifier si le texte custom est déjà présent
+    if custom_text in name:
+        final_name = name
+    else:
+        if position == 'end':
+            final_name = f"{name} {custom_text}"
+        else:
+            final_name = f"{custom_text} {name}"
+
+    # Nettoyer les espaces multiples
+    final_name = re.sub(r'\s+', ' ', final_name).strip()
+
+    return f"{final_name}{ext}"
 
  
 
@@ -1939,6 +1945,7 @@ async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None
         temp_path = os.path.join(TEMP_DIR, temp_filename)
         if sess is not None:
             sess['temp_path'] = temp_path
+       
         else:
             user_sessions[user_id]['temp_path'] = temp_path
         
