@@ -1581,8 +1581,10 @@ async def file_handler(event):
     # Limits check
     limit_ok, limit_message = check_user_limits(user_id, file_size_bytes)
     if not limit_ok:
+        # Ajout du message explicite en anglais
         await event.reply(
-            f"⚠️ <b>Limit Reached!</b>\n\n{limit_message}",
+            "❌ You have used all your daily quota!\n\n"
+            "You have reached your daily usage limit for today. Please try again tomorrow.",
             parse_mode='html'
         )
         return
@@ -1869,7 +1871,7 @@ async def rename_reply_handler(event):
             # Inform waiting only if there was already a job or a worker running
             if worker_active or size_before > 0:
                 await event.reply("🕒 File queued… I will process it after the current file.")
-            # Delete prompt now; worker will cleanup the cache after processing
+            # Delete prompt now; worker will process immediately if this is the only job
             try:
                 pm = sess.get('prompt_msg')
                 if pm:
@@ -1899,167 +1901,6 @@ async def rename_reply_handler(event):
         except Exception:
             pass
         if user_id in user_sessions:
-            del user_sessions[user_id]
-
-async def process_file(event, user_id, new_name=None, use_thumb=False, sess=None):
-    """Generic function to process (download and upload) a file."""
-    
-    # Prefer per-message session if provided
-    if sess is None and user_id not in user_sessions:
-        return
-
-    progress_msg = None
-    reencoded_path = None
-    temp_path = None
-
-    try:
-        if new_name is None:
-            base_info = sess if sess is not None else user_sessions[user_id]
-            new_name = base_info['file_name']
-        
-        sanitized_name = sanitize_filename(new_name)
-        # Add custom text if present
-        custom_text = sessions.get(user_id, {}).get('custom_text', '')
-        text_position = sessions.get(user_id, {}).get('text_position', 'end')
-        if custom_text:
-            sanitized_name = add_custom_text_to_filename(sanitized_name, custom_text, text_position)
-        
-        # Initial progress message
-        if isinstance(event, events.CallbackQuery.Event):
-             progress_msg = await event.edit("Processing...", parse_mode=None)
-        else:
-             progress_msg = await event.reply("Processing...", parse_mode=None)
-
-        await bot(SetTypingRequest(
-            event.chat_id, 
-            SendMessageUploadDocumentAction(progress=0)
-        ))
-        
-        base_info = sess if sess is not None else user_sessions[user_id]
-        original_msg = base_info.get('original_msg') or base_info.get('message')
-        if not original_msg:
-            raise Exception("Missing original message in session")
-        is_video = base_info.get('is_video', False)
-        
-        temp_filename = "{}_{}_{}".format(user_id, int(time.time()), uuid.uuid4().hex[:8])
-        temp_path = os.path.join(TEMP_DIR, temp_filename)
-        if sess is not None:
-            sess['temp_path'] = temp_path
-       
-        else:
-            user_sessions[user_id]['temp_path'] = temp_path
-        
-        start_time = time.time()
-        last_update_time = [start_time]
-        
-        async def download_progress(current, total):
-            await progress_callback(current, total, event, start_time, progress_msg, "Downloading", last_update_time)
-        
-        path = await original_msg.download_media(
-            file=temp_path,
-            progress_callback=download_progress
-        )
-        
-        if not path or not os.path.exists(path):
-            raise Exception("Failed to download file")
-        
-        if path != temp_path:
-            shutil.move(path, temp_path)
-        
-        upload_path = temp_path
-        
-        # Check/convert for compatibility if it's a video
-        if is_video:
-            temp_path = await ensure_video_compatibility(temp_path, progress_msg)
-            # Create optimized attributes
-            video_attributes = get_video_attributes(temp_path, sanitized_name)
-        else:
-            video_attributes = []
-        
-        # SKIP FFmpeg - not necessary for simple renaming
-        # Optimization disabled to improve performance
-        
-        await safe_edit(progress_msg, "Preparing upload...", parse_mode=None)
-        
-        start_time = time.time()
-        last_update_time_upload = [start_time]
-        
-        async def upload_progress(current, total):
-            await progress_callback(current, total, event, start_time, progress_msg, "Uploading", last_update_time_upload)
-        
-        thumb_to_use = None
-        if use_thumb:
-            thumb_path = os.path.join(THUMBNAIL_DIR, "{}.jpg".format(user_id))
-            if os.path.exists(thumb_path):
-                thumb_to_use = thumb_path
-        
-        # Add filename attribute
-        file_attributes = [DocumentAttributeFilename(sanitized_name)]
-        
-        # Add video attributes if available
-        if video_attributes:
-            file_attributes.extend(video_attributes)
-        
-        # Create caption with filename
-        caption = f"<code>{sanitized_name}</code>"
-        
-        # Send file with all necessary attributes
-        await safe_send_file(
-            event.client,
-            event.chat_id,
-            upload_path,
-            caption=caption,  # Caption with filename
-            parse_mode='html',
-            file_name=sanitized_name,
-            thumb=thumb_to_use,
-            supports_streaming=True,  # ✅ Always True for videos
-            force_document=True,      # ✅ Always True to force document mode
-            attributes=file_attributes,
-            progress_callback=upload_progress,
-            part_size_kb=512,  # Optimized chunks for better performance
-            allow_cache=False  # ✅ Force Telegram to regenerate previews
-        )
-        
-        await progress_msg.delete()
-        
-        # Update user usage after successful processing
-        size_val = (sess or {}).get('file_size') if sess is not None else user_sessions.get(user_id, {}).get('file_size')
-        if size_val is not None:
-            update_user_usage(user_id, size_val)
-            logging.info(f"Usage updated for user {user_id}: +{human_readable_size(size_val)}")
-            try:
-                await add_rename_stat(int(user_sessions[user_id]['file_size'] or 0))
-            except Exception:
-                pass
-        
-    except FloodWaitError as e:
-        if progress_msg:
-             await safe_edit(progress_msg, "⏳ Rate limit hit. Please wait {} seconds.".format(e.seconds))
-        else:
-            await event.reply("⏳ Rate limit hit. Please wait {} seconds.".format(e.seconds))
-    except Exception as e:
-        error_msg = "❌ <b>Error:</b> {}\n\nPlease try again.".format(str(e))
-        if progress_msg:
-            await safe_edit(progress_msg, error_msg, parse_mode='html')
-        else:
-            await event.reply(error_msg, parse_mode='html')
-        
-    finally:
-        # Improved cleanup
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError as e:
-                logging.error(f"Error deleting temp_path {temp_path}: {e}")
-        
-        if reencoded_path and os.path.exists(reencoded_path):
-            try:
-                os.remove(reencoded_path)
-            except OSError as e:
-                logging.error(f"Error deleting reencoded_path {reencoded_path}: {e}")
-
-        # Only delete legacy session if we were operating on it
-        if sess is None and user_id in user_sessions:
             del user_sessions[user_id]
 
 
@@ -2263,77 +2104,3 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
                 except:
                     pass
             del user_sessions[user_id]
-
-def main():
-    """Main function modified"""
-    print("🤖 Bot started successfully!")
-    print("📁 Temp directory: {}".format(TEMP_DIR))
-    print("🖼️ Thumbnail directory: {}".format(THUMBNAIL_DIR))
-    print(f"📂 Download directory: {DOWNLOAD_DIR}")
-    print(f"👥 Admin IDs: {ADMIN_SET}")
-    print(f"🕒 Bot started at: {START_TIME}")
-    
-    # Start upload worker for queue processing
-    bot.loop.create_task(upload_worker())
-    # Start auto cleanup task
-    bot.loop.create_task(auto_cleanup_task())
-    # Load preferences
-    load_user_preferences()
-    print("📊 User data loaded")
-    
-    # Send a message to all users who have interacted with the bot
-    async def notify_all_users():
-        # Get all user IDs from usage data
-        all_users = list(user_usage.keys())
-        
-        # Add admin IDs if configured
-        if ADMIN_IDS:
-            admin_list = [int(x) for x in str(ADMIN_IDS).split(',') if x.strip()]
-            for admin_id in admin_list:
-                if admin_id not in all_users:
-                    all_users.append(admin_id)
-        
-        # Remove duplicates
-        all_users = list(set(all_users))
-        
-        # Send startup message to all users
-        startup_message = (
-            f"🟢 <b>Bot started!</b>\n\n"
-            f"Rename bot is now online and ready.\n\n"
-            f"📈 Daily limit: {human_readable_size(DAILY_LIMIT_BYTES)}\n"
-            f"⏱ Cooldown: {COOLDOWN_SECONDS}s\n"
-            f"⚡ Fast mode: ENABLED\n"
-            f"📢 Force Join: @{FORCE_JOIN_CHANNEL}"
-        )
-        
-        success_count = 0
-        for user_id in all_users:
-            try:
-                await bot.send_message(
-                    user_id, 
-                    startup_message,
-                    parse_mode='html'
-                )
-                success_count += 1
-                # Small delay to avoid flood
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                logging.error(f"Failed to send startup message to user {user_id}: {e}")
-                continue
-        
-        print(f"📢 Startup message sent to {success_count}/{len(all_users)} users")
-    
-    # Start automatic cleanup task
-    async def start_cleanup():
-        await auto_cleanup_task()
-    
-    # Notify all users and start cleanup
-    bot.loop.run_until_complete(notify_all_users())
-    bot.loop.create_task(start_cleanup())
-    
-    # Start the bot
-    print("\n✅ Bot is running! Press Ctrl+C to stop.\n")
-    bot.run_until_disconnected()
-
-if __name__ == '__main__':
-    main()
