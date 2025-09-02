@@ -20,12 +20,14 @@ from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import SendMessageTypingAction, SendMessageUploadDocumentAction
 from telethon.tl.functions.channels import GetParticipantRequest
 import logging
-
+from utils.quota import increment_if_under_limit
 from dotenv import load_dotenv
 
 # Load environment variables from .env if present
 load_dotenv()
-
+# Configuration des quotas
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "10"))
+QUOTA_TZ = os.getenv("QUOTA_TZ", "UTC")
 # Upload queue and worker system
 UPLOAD_QUEUE = asyncio.Queue()
 UPLOAD_SEMAPHORE = asyncio.Semaphore(1)  # 1 upload at a time
@@ -1504,8 +1506,23 @@ async def showthumb_handler(event):
 async def photo_handler(event):
     """Handler for photos (thumbnails)"""
     user_id = event.sender_id
+    
     # Ignore channels and groups
     if not event.is_private:
+        return
+        
+    # Vérifier le quota
+    ok, remaining, reset_time = await increment_if_under_limit(
+        user_id=user_id,
+        daily_limit=DAILY_LIMIT,
+        tz_name=QUOTA_TZ
+    )
+    if not ok:
+        await event.reply(
+            f"🚫 You've used all your daily quota for today. "
+            f"Please try again after {reset_time}.",
+            parse_mode='html'
+        )
         return
     
     # Check if user is in set_thumbnail mode
@@ -1559,6 +1576,20 @@ async def file_handler(event):
     if not event.is_private:
         return
     
+    # Vérifier le quota
+    ok, remaining, reset_time = await increment_if_under_limit(
+        user_id=user_id,
+        daily_limit=DAILY_LIMIT,
+        tz_name=QUOTA_TZ
+    )
+    if not ok:
+        await event.reply(
+            f"🚫 You've used all your daily quota for today. "
+            f"Please try again after {reset_time}.",
+            parse_mode='html'
+        )
+        return
+    
     # Force-join
     ok, missing = await is_user_in_required_channels(user_id)
     if not ok:
@@ -1578,16 +1609,7 @@ async def file_handler(event):
         )
         return
     
-    # Limits check
-    limit_ok, limit_message = check_user_limits(user_id, file_size_bytes)
-    if not limit_ok:
-        # Ajout du message explicite en anglais
-        await event.reply(
-            "❌ You have used all your daily quota!\n\n"
-            "You have reached your daily usage limit for today. Please try again tomorrow.",
-            parse_mode='html'
-        )
-        return
+    # Quota check is now done at the beginning of the function
     
     file_name = file.name or "unnamed_file"
     extension = os.path.splitext(file_name)[1] or ""
@@ -1637,6 +1659,21 @@ async def callback_handler(event):
     """Stateless handler for inline buttons and settings"""
     data = event.data.decode('utf-8')
     user_id = event.query.user_id
+    
+    # Ignorer la vérification des quotas pour certaines commandes
+    if not data.startswith(('cancel|', 'no_thumb', 'show_settings', 'back_to_main', 'toggle_')):
+        # Vérifier le quota pour les actions qui en consomment
+        ok, remaining, reset_time = await increment_if_under_limit(
+            user_id=user_id,
+            daily_limit=DAILY_LIMIT,
+            tz_name=QUOTA_TZ
+        )
+        if not ok:
+            await event.answer(
+                f"🚫 Quota reached! Try again after {reset_time}",
+                alert=True
+            )
+            return
     
     # Settings menu and existing settings options
     if data == "show_settings":
@@ -1783,12 +1820,29 @@ async def callback_handler(event):
                 }
                 return
 
-@bot.on(events.NewMessage(func=lambda e: e.is_reply and e.text))
+@bot.on(events.NewMessage(func=lambda e: e.is_reply and e.message.reply_to_msg_id and not e.photo))
 async def rename_reply_handler(event):
     """Handle replies for stateless rename flows"""
     user_id = event.sender_id
+    chat_id = event.chat_id
+    reply_to = await event.get_reply_message()
+    
     # Ignore channels and groups
     if not event.is_private:
+        return
+        
+    # Vérifier le quota
+    ok, remaining, reset_time = await increment_if_under_limit(
+        user_id=user_id,
+        daily_limit=DAILY_LIMIT,
+        tz_name=QUOTA_TZ
+    )
+    if not ok:
+        await event.reply(
+            f"🚫 You've used all your daily quota for today. "
+            f"Please try again after {reset_time}.",
+            parse_mode='html'
+        )
         return
     
     if user_id not in user_sessions:
@@ -1936,13 +1990,25 @@ async def process_with_thumbnail_queued(event, user_id, new_name, sess=None):
 
 async def process_with_thumbnail(event, user_id, new_name, sess=None):
     """Processes the file with thumbnail and new name"""
-    
-    if sess is None and user_id not in user_sessions:
-        return
-    
     progress_msg = None
     temp_path = None
+    stored_data = None
+    storage_key = None
     
+    # Vérifier le quota
+    ok, remaining, reset_time = await increment_if_under_limit(
+        user_id=user_id,
+        daily_limit=DAILY_LIMIT,
+        tz_name=QUOTA_TZ
+    )
+    if not ok:
+        await event.reply(
+            f"🚫 You've used all your daily quota for today. "
+            f"Please try again after {reset_time}.",
+            parse_mode='html'
+        )
+        return
+        
     try:
         # Prepare name
         sanitized_name = sanitize_filename(new_name)
@@ -2104,3 +2170,16 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
                 except:
                     pass
             del user_sessions[user_id]
+
+# Ajoutez ce code à la fin du fichier, après toutes les fonctions
+if __name__ == '__main__':
+    print("🔄 Starting bot...")
+    try:
+        # Démarrer le client
+        with bot:
+            print("✅ Bot is running! Press Ctrl+C to stop.")
+            bot.run_until_disconnected()
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+    finally:
+        print("🛑 Bot stopped")
