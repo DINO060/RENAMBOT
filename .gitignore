@@ -20,6 +20,8 @@ downloads/
 temp_files/
 thumbnails/
 user_thumbnails/
+main_fixed.py/
+
 
 # Fichiers système
 .DS_Store
