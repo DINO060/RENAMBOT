@@ -307,7 +307,7 @@ TEMP_DIR = "temp_files"
 THUMBNAIL_DIR = "thumbnails"
 DOWNLOAD_DIR = "downloads"  # New directory to store files
 USER_TIMEOUT = 600  # 10 minutes
-PROGRESS_UPDATE_INTERVAL = 5  # seconds
+PROGRESS_UPDATE_INTERVAL = 8  # seconds (réduit la fréquence de mise à jour pour améliorer la vitesse)
 MAX_THUMB_SIZE = 200 * 1024  # 200 KB
 
 # New limits
@@ -2298,7 +2298,8 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         
         path = await original_msg.download_media(
             file=temp_path,
-            progress_callback=download_progress
+            progress_callback=download_progress,
+            part_size_kb=1024  # Augmente la taille des chunks à 1 MB (au lieu de 256 KB par défaut)
         )
         
         if not path or not os.path.exists(path):
@@ -2343,7 +2344,8 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
             force_document=not is_video,
             attributes=file_attributes,
             progress_callback=upload_progress,
-            allow_cache=False
+            allow_cache=False,
+            part_size_kb=1024  # Augmente la taille des chunks d'upload à 1 MB
         )
         
         await progress_msg.delete()
