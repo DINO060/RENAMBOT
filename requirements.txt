@@ -1,3 +1,4 @@
 telethon
 tgcrypto
 python-dotenv
+aiosqlite>=0.20.0

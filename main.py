@@ -582,6 +582,94 @@ async def ping_handler(event):
     """Test to see if bot responds"""
     await event.reply("🏓 Pong! Bot active.")
 
+@bot.on(events.NewMessage(pattern=r"/broadcast(?:\s+.*)?"))
+async def broadcast_cmd(event):
+    """Admin command to broadcast message to all users"""
+    user_id = event.sender_id
+    # Ignore channels and groups
+    if not event.is_private:
+        return
+
+    if not is_admin(user_id):
+        await event.reply("🚫 Admins only.")
+        return
+
+    text = event.raw_text or event.text or ""
+    parts = text.split(maxsplit=1)
+
+    if len(parts) < 2 or not parts[1].strip():
+        await event.reply(
+            "Usage: /broadcast <message>\n\n"
+            "Example: /broadcast Hello everyone! The bot will be under maintenance soon."
+        )
+        return
+
+    broadcast_msg = parts[1].strip()
+
+    # Get all unique user IDs from user_usage
+    try:
+        all_users = set()
+
+        # Load from user_usage.json
+        if os.path.exists(usage_file):
+            with open(usage_file, 'r') as f:
+                data = json.load(f)
+                all_users.update(int(uid) for uid in data.keys())
+
+        # Load from user_preferences.json
+        if os.path.exists('user_preferences.json'):
+            with open('user_preferences.json', 'r') as f:
+                data = json.load(f)
+                all_users.update(int(uid) for uid in data.keys())
+
+        # Load from quota database
+        try:
+            import aiosqlite
+            db_path = os.getenv("QUOTA_DB_PATH", "quota.db")
+            if os.path.exists(db_path):
+                async with aiosqlite.connect(db_path) as db:
+                    cur = await db.execute("SELECT DISTINCT user_id FROM quotas")
+                    rows = await cur.fetchall()
+                    await cur.close()
+                    all_users.update(row[0] for row in rows)
+        except Exception as e:
+            logging.warning(f"Could not load users from quota DB: {e}")
+
+        if not all_users:
+            await event.reply("❌ No users found in database.")
+            return
+
+        status_msg = await event.reply(f"📢 Broadcasting to {len(all_users)} users...")
+
+        success_count = 0
+        fail_count = 0
+        blocked_count = 0
+
+        for uid in all_users:
+            try:
+                await bot.send_message(uid, f"📢 <b>BROADCAST MESSAGE</b>\n\n{broadcast_msg}", parse_mode='html')
+                success_count += 1
+                await asyncio.sleep(0.05)  # Small delay to avoid flood
+            except Exception as e:
+                if "blocked" in str(e).lower() or "user is deactivated" in str(e).lower():
+                    blocked_count += 1
+                else:
+                    fail_count += 1
+                    logging.warning(f"Failed to send broadcast to {uid}: {e}")
+
+        result_text = (
+            f"✅ <b>Broadcast Complete!</b>\n\n"
+            f"• Total users: {len(all_users)}\n"
+            f"• Sent successfully: {success_count}\n"
+            f"• Blocked/Deactivated: {blocked_count}\n"
+            f"• Failed: {fail_count}"
+        )
+
+        await safe_edit(status_msg, result_text, parse_mode='html')
+
+    except Exception as e:
+        await event.reply(f"❌ Error during broadcast: {str(e)}", parse_mode='html')
+
 @bot.on(events.NewMessage(pattern=r"/channels$"))
 async def channels_cmd(event):
     user_id = event.sender_id
@@ -1155,6 +1243,7 @@ Send me any file and I'll help you rename it.
 /channels - Show force join channels
 /addfsub - Add force join channel
 /delfsub - Remove force join channel
+/broadcast - Send message to all users
 
 <b>📤 Just send me a file to get started!</b>"""
     
@@ -1237,6 +1326,71 @@ async def status_handler(event):
         total_renamed = 0
         total_storage_used = 0.0
 
+    # User statistics
+    total_users = 0
+    active_1h = 0
+    active_24h = 0
+    active_7d = 0
+    inactive_7d = 0
+    custom_captions = 0
+
+    try:
+        now = datetime.now()
+        all_users = set()
+
+        # Count users from user_usage.json
+        if os.path.exists(usage_file):
+            with open(usage_file, 'r') as f:
+                data = json.load(f)
+                all_users.update(int(uid) for uid in data.keys())
+                for uid_str, usage_data in data.items():
+                    last_file_time = usage_data.get('last_file_time')
+                    if last_file_time:
+                        try:
+                            last_time = datetime.fromisoformat(last_file_time)
+                            diff = (now - last_time).total_seconds()
+                            if diff <= 3600:  # 1 hour
+                                active_1h += 1
+                            if diff <= 86400:  # 24 hours
+                                active_24h += 1
+                            if diff <= 604800:  # 7 days
+                                active_7d += 1
+                            else:
+                                inactive_7d += 1
+                        except Exception:
+                            pass
+
+        # Count users from user_preferences.json
+        if os.path.exists('user_preferences.json'):
+            with open('user_preferences.json', 'r') as f:
+                data = json.load(f)
+                all_users.update(int(uid) for uid in data.keys())
+                for uid_str, pref_data in data.items():
+                    if pref_data.get('custom_text'):
+                        custom_captions += 1
+
+        # Load from quota database
+        try:
+            import aiosqlite
+            db_path = os.getenv("QUOTA_DB_PATH", "quota.db")
+            if os.path.exists(db_path):
+                async with aiosqlite.connect(db_path) as db:
+                    cur = await db.execute("SELECT DISTINCT user_id FROM quotas")
+                    rows = await cur.fetchall()
+                    await cur.close()
+                    all_users.update(row[0] for row in rows)
+        except Exception as e:
+            logging.warning(f"Could not load users from quota DB: {e}")
+
+        total_users = len(all_users)
+
+    except Exception as e:
+        logging.error(f"Error calculating user stats: {e}")
+
+    # Force join channels
+    force_channels = get_forced_channels()
+    force_status = f"ON ({len(force_channels)})" if force_channels else "OFF"
+
     text = (
         "⌬ BOT STATISTICS :\n\n"
         f"┎ Bᴏᴛ Uᴘᴛɪᴍᴇ : {uptime_str()}\n"
@@ -1249,7 +1403,21 @@ async def status_handler(event):
         f"{disk_block}"
         f"┎ RENAME STATISTICS :\n"
         f"┃ Files renamed : {total_renamed}\n"
-        f"┖ Storage used : {format_bytes(total_storage_used)}\n"
+        f"┖ Storage used : {format_bytes(total_storage_used)}\n\n"
+        f"👤 Your status\n"
+        f"• Captions: {custom_captions}\n"
+        f"• Active: none\n\n"
+        f"👥 Users:\n"
+        f"• Total: {total_users}\n"
+        f"• Active (1 hour): {active_1h}\n"
+        f"• Active (24 hours): {active_24h}\n"
+        f"• Active (7 days): {active_7d}\n"
+        f"• Inactive (7+ days): {inactive_7d}\n\n"
+        f"🛡 System\n"
+        f"• Files: {total_renamed}\n"
+        f"• Storage: {format_bytes(total_storage_used)}\n"
+        f"• Force: {force_status}\n"
+        f"• Uptime: {uptime_str()}\n"
     )
     await event.reply(text, parse_mode='html')
 
@@ -1512,10 +1680,11 @@ async def photo_handler(event):
         return
         
     # Vérifier le quota
-    ok, remaining, reset_time = await increment_if_under_limit(
+    ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
         user_id=user_id,
         daily_limit=DAILY_LIMIT,
-        tz_name=QUOTA_TZ
+        tz_name=QUOTA_TZ,
+        is_admin=is_admin(user_id)
     )
     if not ok:
         await event.reply(
@@ -1524,6 +1693,17 @@ async def photo_handler(event):
             parse_mode='html'
         )
         return
+
+    # Notification si quota vient d'être atteint
+    if just_hit_limit:
+        await bot.send_message(
+            user_id,
+            f"⚠️ <b>Quota Alert!</b>\n\n"
+            f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
+            f"Your quota will reset at {reset_time}.\n\n"
+            f"<i>Thank you for using the bot!</i>",
+            parse_mode='html'
+        )
     
     # Check if user is in set_thumbnail mode
     if user_id in user_sessions and user_sessions[user_id].get('action') == 'set_thumbnail':
@@ -1577,10 +1757,11 @@ async def file_handler(event):
         return
     
     # Vérifier le quota
-    ok, remaining, reset_time = await increment_if_under_limit(
+    ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
         user_id=user_id,
         daily_limit=DAILY_LIMIT,
-        tz_name=QUOTA_TZ
+        tz_name=QUOTA_TZ,
+        is_admin=is_admin(user_id)
     )
     if not ok:
         await event.reply(
@@ -1589,6 +1770,17 @@ async def file_handler(event):
             parse_mode='html'
         )
         return
+
+    # Notification si quota vient d'être atteint
+    if just_hit_limit:
+        await bot.send_message(
+            user_id,
+            f"⚠️ <b>Quota Alert!</b>\n\n"
+            f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
+            f"Your quota will reset at {reset_time}.\n\n"
+            f"<i>Thank you for using the bot!</i>",
+            parse_mode='html'
+        )
     
     # Force-join
     ok, missing = await is_user_in_required_channels(user_id)
@@ -1661,12 +1853,13 @@ async def callback_handler(event):
     user_id = event.query.user_id
     
     # Ignorer la vérification des quotas pour certaines commandes
-    if not data.startswith(('cancel|', 'no_thumb', 'show_settings', 'back_to_main', 'toggle_')):
+    if not data.startswith(('cancel|', 'no_thumb', 'show_settings', 'back_to_main', 'toggle_', 'close_')):
         # Vérifier le quota pour les actions qui en consomment
-        ok, remaining, reset_time = await increment_if_under_limit(
+        ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
             user_id=user_id,
             daily_limit=DAILY_LIMIT,
-            tz_name=QUOTA_TZ
+            tz_name=QUOTA_TZ,
+            is_admin=is_admin(user_id)
         )
         if not ok:
             await event.answer(
@@ -1674,6 +1867,17 @@ async def callback_handler(event):
                 alert=True
             )
             return
+
+        # Notification si quota vient d'être atteint
+        if just_hit_limit:
+            await bot.send_message(
+                user_id,
+                f"⚠️ <b>Quota Alert!</b>\n\n"
+                f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
+                f"Your quota will reset at {reset_time}.\n\n"
+                f"<i>Thank you for using the bot!</i>",
+                parse_mode='html'
+            )
     
     # Settings menu and existing settings options
     if data == "show_settings":
@@ -1764,6 +1968,12 @@ async def callback_handler(event):
                 await event.edit("❌ <b>Cancelled.</b>", parse_mode='html')
                 return
             elif action in ("ren", "thumb"):
+                # Supprimer le message avec les boutons
+                try:
+                    await event.delete()
+                except Exception as e:
+                    logging.warning(f"Could not delete button message: {e}")
+
                 # Build prompt message and send a NEW message with ForceReply
                 if action == "thumb":
                     try:
@@ -1832,10 +2042,11 @@ async def rename_reply_handler(event):
         return
         
     # Vérifier le quota
-    ok, remaining, reset_time = await increment_if_under_limit(
+    ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
         user_id=user_id,
         daily_limit=DAILY_LIMIT,
-        tz_name=QUOTA_TZ
+        tz_name=QUOTA_TZ,
+        is_admin=is_admin(user_id)
     )
     if not ok:
         await event.reply(
@@ -1844,6 +2055,17 @@ async def rename_reply_handler(event):
             parse_mode='html'
         )
         return
+
+    # Notification si quota vient d'être atteint
+    if just_hit_limit:
+        await bot.send_message(
+            user_id,
+            f"⚠️ <b>Quota Alert!</b>\n\n"
+            f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
+            f"Your quota will reset at {reset_time}.\n\n"
+            f"<i>Thank you for using the bot!</i>",
+            parse_mode='html'
+        )
     
     if user_id not in user_sessions:
         return
@@ -1996,10 +2218,11 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
     storage_key = None
     
     # Vérifier le quota
-    ok, remaining, reset_time = await increment_if_under_limit(
+    ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
         user_id=user_id,
         daily_limit=DAILY_LIMIT,
-        tz_name=QUOTA_TZ
+        tz_name=QUOTA_TZ,
+        is_admin=is_admin(user_id)
     )
     if not ok:
         await event.reply(
@@ -2008,6 +2231,17 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
             parse_mode='html'
         )
         return
+
+    # Notification si quota vient d'être atteint
+    if just_hit_limit:
+        await bot.send_message(
+            user_id,
+            f"⚠️ <b>Quota Alert!</b>\n\n"
+            f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
+            f"Your quota will reset at {reset_time}.\n\n"
+            f"<i>Thank you for using the bot!</i>",
+            parse_mode='html'
+        )
         
     try:
         # Prepare name
