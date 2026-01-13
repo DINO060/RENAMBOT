@@ -2298,8 +2298,7 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         
         path = await original_msg.download_media(
             file=temp_path,
-            progress_callback=download_progress,
-            part_size_kb=1024  # Augmente la taille des chunks à 1 MB (au lieu de 256 KB par défaut)
+            progress_callback=download_progress
         )
         
         if not path or not os.path.exists(path):
