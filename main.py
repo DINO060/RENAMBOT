@@ -370,6 +370,126 @@ PROCESSING_LOCKS = defaultdict(asyncio.Lock)
 ORIGINAL_MESSAGES = {}
 MESSAGE_CLEANUP_TIME = 3600  # seconds (1 hour)
 
+# =============================
+# Several files at once (an album, or forwarded together): one question for all of them
+# =============================
+BATCH_WINDOW = 2.5        # seconds without a new file that close a group
+PENDING_FILES = defaultdict(list)   # user_id -> [(chat_id, msg_id), ...] still arriving
+PENDING_TASKS = {}                  # user_id -> the task that closes the group
+BATCHES = {}                        # batch id -> {'user', 'chat', 'keys', 'created'}
+
+
+def _file_question(stored: dict, has_thumbnail: bool, chat_id: int, msg_id: int):
+    """The usual one-file question: text and buttons."""
+    buttons = []
+    if has_thumbnail:
+        buttons.append([Button.inline("🖼️ Add Thumbnail", f"thumb|{chat_id}|{msg_id}")])
+    else:
+        buttons.append([Button.inline("🖼️ Set Thumbnail First", "no_thumb")])
+    buttons.append([Button.inline("✏️ Rename Only", f"ren|{chat_id}|{msg_id}")])
+    buttons.append([Button.inline("❌ Cancel", f"cancel|{chat_id}|{msg_id}")])
+    info_text = f"""📁 <b>FILE INFORMATION</b>
+
+◆ <b>Name:</b> <code>{stored['file_name']}</code>
+◆ <b>Size:</b> {human_readable_size(stored['file_size'])}
+◆ <b>Type:</b> {stored['mime_type']} {"🎬" if stored['is_video'] else ""}
+
+❓ <b>What do you want to do?</b>"""
+    return info_text, buttons
+
+
+async def _ask_one(user_id: int, key) -> None:
+    stored = ORIGINAL_MESSAGES.get(key)
+    if not stored:
+        return
+    chat_id, msg_id = key
+    has_thumbnail = os.path.exists(os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg"))
+    text, buttons = _file_question(stored, has_thumbnail, chat_id, msg_id)
+    await bot.send_message(chat_id, text, parse_mode='html', buttons=buttons, reply_to=msg_id)
+
+
+async def _close_group(user_id: int, chat_id: int) -> None:
+    """No new file for BATCH_WINDOW seconds: one file → the usual question; several → one question."""
+    try:
+        await asyncio.sleep(BATCH_WINDOW)
+    except asyncio.CancelledError:
+        return
+    PENDING_TASKS.pop(user_id, None)
+    keys = [k for k in PENDING_FILES.pop(user_id, []) if k in ORIGINAL_MESSAGES]
+    if not keys:
+        return
+    if len(keys) == 1:
+        await _ask_one(user_id, keys[0])
+        return
+    batch_id = uuid.uuid4().hex[:10]
+    BATCHES[batch_id] = {'user': user_id, 'chat': chat_id, 'keys': keys, 'created': datetime.now()}
+    files = [ORIGINAL_MESSAGES[k] for k in keys]
+    videos = sum(1 for f in files if f['is_video'])
+    has_thumbnail = os.path.exists(os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg"))
+    text = f"""📦 <b>{len(keys)} FILES RECEIVED</b>
+
+◆ <b>Total size:</b> {human_readable_size(sum(f['file_size'] or 0 for f in files))}
+◆ <b>Videos:</b> {videos} 🎬
+
+❓ <b>What do you want to do?</b>
+🖼️ <b>Thumbnail on all</b>: your thumbnail goes on every file, names kept, sent back in order.
+✏️ <b>One by one</b>: I ask you for each file, as usual."""
+    if has_thumbnail:
+        first = [Button.inline(f"🖼️ Thumbnail on all {len(keys)}", f"bthumb|{batch_id}")]
+    else:
+        first = [Button.inline("🖼️ Set Thumbnail First (/setthumb)", "no_thumb")]
+    buttons = [first, [Button.inline("✏️ One by one", f"bone|{batch_id}")],
+               [Button.inline("❌ Cancel", f"bcancel|{batch_id}")]]
+    await bot.send_message(chat_id, text, parse_mode='html', buttons=buttons, reply_to=keys[0][1])
+
+
+async def _batch_callback(event, data: str, user_id: int) -> None:
+    """🖼️ Thumbnail on all / ✏️ One by one / ❌ Cancel for a group of files."""
+    action, batch_id = data.split("|", 1)
+    batch = BATCHES.get(batch_id)
+    if not batch or batch['user'] != user_id:
+        await event.answer("This group has expired. Send the files again.", alert=True)
+        return
+    if action == "bcancel":
+        BATCHES.pop(batch_id, None)
+        for key in batch['keys']:
+            ORIGINAL_MESSAGES.pop(key, None)
+        await event.edit("❌ <b>Cancelled.</b>", parse_mode='html')
+        return
+    if action == "bone":
+        BATCHES.pop(batch_id, None)
+        await event.edit(f"✏️ <b>One by one</b>: {len(batch['keys'])} questions below.", parse_mode='html')
+        for key in batch['keys']:
+            await _ask_one(user_id, key)
+        return
+    # bthumb: every file, in order, through the user's thumbnail queue
+    if not os.path.exists(os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")):
+        await event.answer("Set a thumbnail first with /setthumb", alert=True)
+        return
+    BATCHES.pop(batch_id, None)
+    keys = [k for k in batch['keys'] if k in ORIGINAL_MESSAGES]
+    total = len(keys)
+    q = THUMB_QUEUES.setdefault(user_id, asyncio.Queue())
+    for i, key in enumerate(keys, 1):
+        stored = ORIGINAL_MESSAGES[key]
+        await q.put({
+            'chat_id': batch['chat'],
+            'new_name': stored['file_name'],
+            'sess': {
+                'action': 'thumb_stateless',
+                'original_msg': stored['message'],
+                'stored_data': stored,
+                'storage_key': key,
+                'timestamp': datetime.now(),
+                'batch': (i, total),
+                'no_quota': True,            # each file was counted when it arrived
+            },
+        })
+    ensure_thumb_worker(user_id)
+    missing = len(batch['keys']) - total
+    await event.edit(f"🖼️ <b>Adding your thumbnail to {total} files…</b>\nThey come back one by one, in order."
+                     + (f"\n⚠️ {missing} file(s) expired: send them again." if missing else ""), parse_mode='html')
+
 async def cleanup_old_messages():
     """Remove cached message references older than MESSAGE_CLEANUP_TIME."""
     try:
@@ -1215,6 +1335,7 @@ Send me any file and I'll help you rename it.
 • Support all file types (up to 2 GB)
 • Custom text/username addition
 • Fast thumbnail processing ⚡
+• Send many files at once: one tap puts your thumbnail on all of them 📦
 • Auto-cleanup of @tags and #hashtags
 • Video streaming support 🎬"""
     
@@ -1807,12 +1928,7 @@ async def file_handler(event):
     extension = os.path.splitext(file_name)[1] or ""
     mime_type = file.mime_type or "unknown"
     is_video = mime_type.startswith('video/') or extension.lower() in ['.mp4', '.mkv', '.webm']
-    file_size = human_readable_size(file_size_bytes)
-    
-    # Thumbnail presence
-    thumb_path = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
-    has_thumbnail = os.path.exists(thumb_path)
-    
+
     # Encode chat and message
     msg_id = event.message.id
     chat_id = event.chat_id
@@ -1828,30 +1944,24 @@ async def file_handler(event):
     }
     # Fire-and-forget periodic cleanup
     asyncio.create_task(cleanup_old_messages())
-    buttons = []
-    if has_thumbnail:
-        buttons.append([Button.inline("🖼️ Add Thumbnail", f"thumb|{chat_id}|{msg_id}")])
-    else:
-        buttons.append([Button.inline("🖼️ Set Thumbnail First", "no_thumb")])
-    buttons.append([Button.inline("✏️ Rename Only", f"ren|{chat_id}|{msg_id}")])
-    buttons.append([Button.inline("❌ Cancel", f"cancel|{chat_id}|{msg_id}")])
-    
-    info_text = f"""📁 <b>FILE INFORMATION</b>
-
-◆ <b>Name:</b> <code>{file_name}</code>
-◆ <b>Size:</b> {file_size}
-◆ <b>Type:</b> {mime_type} {"🎬" if is_video else ""}
-
-❓ <b>What do you want to do?</b>"""
-    
-    await event.reply(info_text, parse_mode='html', buttons=buttons)
+    # Wait a moment: more files may be coming (an album, several forwarded) → one question for all
+    PENDING_FILES[user_id].append(storage_key)
+    previous = PENDING_TASKS.get(user_id)
+    if previous and not previous.done():
+        previous.cancel()
+    PENDING_TASKS[user_id] = asyncio.create_task(_close_group(user_id, chat_id))
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     """Stateless handler for inline buttons and settings"""
     data = event.data.decode('utf-8')
     user_id = event.query.user_id
-    
+
+    # A group of files: each one was already counted when it arrived
+    if data.startswith(('bthumb|', 'bone|', 'bcancel|')):
+        await _batch_callback(event, data, user_id)
+        return
+
     # Ignorer la vérification des quotas pour certaines commandes
     if not data.startswith(('cancel|', 'no_thumb', 'show_settings', 'back_to_main', 'toggle_', 'close_')):
         # Vérifier le quota pour les actions qui en consomment
@@ -2216,33 +2326,35 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
     temp_path = None
     stored_data = None
     storage_key = None
-    
-    # Vérifier le quota
-    ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
-        user_id=user_id,
-        daily_limit=DAILY_LIMIT,
-        tz_name=QUOTA_TZ,
-        is_admin=is_admin(user_id)
-    )
-    if not ok:
-        await event.reply(
-            f"🚫 You've used all your daily quota for today. "
-            f"Please try again after {reset_time}.",
-            parse_mode='html'
-        )
-        return
+    batch = (sess or {}).get('batch')            # (3, 12) for the 3rd file of a group
 
-    # Notification si quota vient d'être atteint
-    if just_hit_limit:
-        await bot.send_message(
-            user_id,
-            f"⚠️ <b>Quota Alert!</b>\n\n"
-            f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
-            f"Your quota will reset at {reset_time}.\n\n"
-            f"<i>Thank you for using the bot!</i>",
-            parse_mode='html'
+    # Vérifier le quota (a file of a group was already counted when it arrived)
+    if not (sess or {}).get('no_quota'):
+        ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
+            user_id=user_id,
+            daily_limit=DAILY_LIMIT,
+            tz_name=QUOTA_TZ,
+            is_admin=is_admin(user_id)
         )
-        
+        if not ok:
+            await event.reply(
+                f"🚫 You've used all your daily quota for today. "
+                f"Please try again after {reset_time}.",
+                parse_mode='html'
+            )
+            return
+
+        # Notification si quota vient d'être atteint
+        if just_hit_limit:
+            await bot.send_message(
+                user_id,
+                f"⚠️ <b>Quota Alert!</b>\n\n"
+                f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
+                f"Your quota will reset at {reset_time}.\n\n"
+                f"<i>Thank you for using the bot!</i>",
+                parse_mode='html'
+            )
+
     try:
         # Prepare name
         sanitized_name = sanitize_filename(new_name)
@@ -2275,7 +2387,9 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         except Exception:
             pass
         
-        progress_msg = await event.reply("Processing with thumbnail...", parse_mode=None)
+        progress_msg = await event.reply(
+            f"Processing with thumbnail... ({batch[0]}/{batch[1]})" if batch else "Processing with thumbnail...",
+            parse_mode=None)
         
         if sess is not None:
             original_msg = sess.get('original_msg')
@@ -2348,7 +2462,9 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         )
         
         await progress_msg.delete()
-        
+        if batch and batch[0] == batch[1]:          # the last file of a group
+            await event.reply(f"✅ <b>Done:</b> {batch[1]} files with your thumbnail.", parse_mode='html')
+
         # Update usage
         update_user_usage(user_id, file_size)
         try:
