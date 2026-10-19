@@ -46,7 +46,7 @@ def video(name, caption): return node("figure", node("video", src=IMG + name), n
 
 def english(other_url):
     return [
-        p("Rename Bot ", b("renames your files"), " (up to 2 GB), puts ", b("your own thumbnail"), " on them and adds ",
+        p("RƐNAM BOT ", b("renames your files"), " (up to 2 GB), puts ", b("your own thumbnail"), " on them and adds ",
           b("your channel's name"), " — one file or a whole season at once. Here is everything it does, step by step."),
         video("explainer_en.mp4", "The bot in 30 seconds"),
         p(a("🇫🇷 Version française", other_url)) if other_url else None,
@@ -94,7 +94,7 @@ def english(other_url):
 
 def french(other_url):
     return [
-        p("Rename Bot ", b("renomme tes fichiers"), " (jusqu'à 2 Go), y met ", b("ta propre miniature"), " et ajoute ",
+        p("RƐNAM BOT ", b("renomme tes fichiers"), " (jusqu'à 2 Go), y met ", b("ta propre miniature"), " et ajoute ",
           b("le nom de ta chaîne"), " — un fichier ou toute une saison d'un coup. Voici tout ce qu'il fait, étape par étape."),
         video("explainer_fr.mp4", "Le bot en 30 secondes"),
         p(a("🇬🇧 English version", other_url)) if other_url else None,
@@ -148,10 +148,10 @@ def main():
     accounts = json.loads(ACCOUNTS.read_text(encoding="utf-8")) if ACCOUNTS.exists() else {}
     acc = accounts.get(KEY) or {}
     if not acc.get("token"):
-        acc["token"] = api("createAccount", short_name="Rename Bot", author_name="Rename Bot",
+        acc["token"] = api("createAccount", short_name="RƐNAM BOT", author_name="RƐNAM BOT",
                            author_url=BOT_URL)["access_token"]
-    common = {"access_token": acc["token"], "author_name": "Rename Bot", "author_url": BOT_URL}
-    titles = {"en": "Rename Bot — How to use it", "fr": "Rename Bot — Mode d'emploi"}
+    common = {"access_token": acc["token"], "author_name": "RƐNAM BOT", "author_url": BOT_URL}
+    titles = {"en": "RƐNAM BOT — How to use it", "fr": "RƐNAM BOT — Mode d'emploi"}
 
     def publish(lang, content):
         if acc.get(lang):

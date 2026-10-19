@@ -13,7 +13,7 @@ from playwright.sync_api import sync_playwright
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "img"
 WORK = Path(tempfile.mkdtemp())
-BOT = "Rename Bot"
+BOT = "RƐNAM BOT"
 FONT_BOLD = "C:/Windows/Fonts/segoeuib.ttf"
 
 # ---------------------------------------------------------------------------------------------- demo pictures
@@ -164,7 +164,7 @@ def screens(thumb, cover):
     return {
         "start": [
             {"side": "out", "html": "/start", "time": T},
-            {"html": "👋 <b>Welcome to Advanced File Rename Bot!</b>\n\nSend me any file and I'll help you rename it.\n\n"
+            {"html": "👋 <b>Welcome to RƐNAM BOT!</b>\n\nSend me any file and I'll help you rename it.\n\n"
                      "<b>📋 Features:</b>\n• Support all file types (up to 2 GB)\n• Custom text/username addition\n"
                      "• Fast thumbnail processing ⚡\n• Send many files at once: one tap puts your thumbnail on all of them 📦\n"
                      "• Auto-cleanup of @tags and #hashtags\n• Video streaming support 🎬\n\n<b>📤 Just send me a file to get started!</b>",
@@ -249,7 +249,7 @@ FLOWS = {"rename": ["file_question", "rename_prompt", "progress", "result"],
          "thumbnail": ["setthumb", "thumb_saved"]}
 
 VIDEO = {
-    "en": [("title", "Rename Bot", "Rename any file up to 2 GB, put your own thumbnail on it — one file or a whole batch.",
+    "en": [("title", "RƐNAM BOT", "Rename any file up to 2 GB, put your own thumbnail on it — one file or a whole batch.",
             "Open the bot and send a file"),
            ("file_question", "STEP 1", "Send a file", "Any file, up to 2 GB. The bot shows what it is and asks what to do."),
            ("rename_prompt", "STEP 2", "Type the new name", "Reply to the bot's message with the name. No extension? It keeps the file's."),
@@ -258,8 +258,8 @@ VIDEO = {
            ("batch_done", "MANY FILES", "Back in order", "Every file comes back with your thumbnail, in the order you sent them."),
            ("thumb_saved", "THUMBNAIL", "Your own thumbnail", "/setthumb, then any photo. It is resized the way Telegram wants it."),
            ("settings", "SETTINGS", "Your channel's name on every file", "Add a custom text, choose start or end, clean the old @tags."),
-           ("title", "Rename Bot", "Faster uploads, clean names, your brand on every file.", "Send /start to begin")],
-    "fr": [("title", "Rename Bot", "Renomme n'importe quel fichier jusqu'à 2 Go et mets-y ta miniature — un fichier ou toute une série.",
+           ("title", "RƐNAM BOT", "Faster uploads, clean names, your brand on every file.", "Send /start to begin")],
+    "fr": [("title", "RƐNAM BOT", "Renomme n'importe quel fichier jusqu'à 2 Go et mets-y ta miniature — un fichier ou toute une série.",
             "Ouvre le bot et envoie un fichier"),
            ("file_question", "ÉTAPE 1", "Envoie un fichier", "N'importe quel fichier, jusqu'à 2 Go. Le bot te le décrit et te demande quoi faire."),
            ("rename_prompt", "ÉTAPE 2", "Tape le nouveau nom", "Réponds au message du bot avec le nom. Sans extension ? Il garde celle du fichier."),
@@ -268,7 +268,7 @@ VIDEO = {
            ("batch_done", "PLUSIEURS FICHIERS", "Dans l'ordre", "Chaque fichier revient avec ta miniature, dans l'ordre où tu les as envoyés."),
            ("thumb_saved", "MINIATURE", "Ta propre miniature", "/setthumb, puis n'importe quelle photo. Elle est redimensionnée comme Telegram le veut."),
            ("settings", "RÉGLAGES", "Le nom de ta chaîne sur chaque fichier", "Ajoute un texte perso, au début ou à la fin, et nettoie les anciens @tags."),
-           ("title", "Rename Bot", "Des envois plus rapides, des noms propres, ta marque sur chaque fichier.", "Envoie /start pour commencer")],
+           ("title", "RƐNAM BOT", "Des envois plus rapides, des noms propres, ta marque sur chaque fichier.", "Envoie /start pour commencer")],
 }
 
 
