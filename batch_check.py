@@ -70,7 +70,7 @@ import utils.quota as _quota  # noqa: E402
 
 _quota.ZoneInfo = lambda name: _dt.timezone.utc     # this Windows Python has no tz database (the VPS has)
 
-main.BATCH_WINDOW = 0.3
+main.BATCH_WINDOW = 1.5            # wide: on Windows a quota write (SQLite) can take longer than 0.3 s
 ok = True
 
 
@@ -122,7 +122,7 @@ async def main_test():
 
     # 1. one file alone: the usual question
     await main.file_handler(file_event(7, 10, "Alone.pdf"))
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(2.0)
     q = sent[-1]
     check("one file: the usual question, as before", "FILE INFORMATION" in q.text and q.reply_to == 10
           and labels(q.buttons) == ["🖼️ Add Thumbnail", "✏️ Rename Only", "❌ Cancel"], str(labels(q.buttons)))
@@ -132,7 +132,7 @@ async def main_test():
     for i, name in enumerate(["Blue Box 01.pdf", "Blue Box 02.pdf", "Blue Box 03.pdf", "Blue Box 04.pdf"]):
         await main.file_handler(file_event(7, 20 + i, name))
         await asyncio.sleep(0.05)
-    await asyncio.sleep(0.6)
+    await asyncio.sleep(2.0)
     new = sent[mark:]
     check("4 files at once: one question only", len(new) == 1 and "4 FILES RECEIVED" in new[0].text
           and labels(new[0].buttons) == ["🖼️ Thumbnail on all 4", "✏️ One by one", "❌ Cancel"],
@@ -163,7 +163,7 @@ async def main_test():
     mark = len(sent)
     for i in range(3):
         await main.file_handler(file_event(42, 40 + i, f"Ep{i}.pdf"))
-    await asyncio.sleep(0.6)
+    await asyncio.sleep(2.0)
     batch_id = sent[-1].buttons[1][0].data.decode().split("|")[1]
     await main.callback_handler(Callback(42, f"bone|{batch_id}"))
     questions = [m for m in sent[mark + 1:] if m.kind == "msg" and "FILE INFORMATION" in m.text]
@@ -172,7 +172,7 @@ async def main_test():
     # 5. Cancel; someone else's group; an expired one
     for i in range(2):
         await main.file_handler(file_event(42, 50 + i, f"X{i}.pdf"))
-    await asyncio.sleep(0.6)
+    await asyncio.sleep(2.0)
     batch_id = sent[-1].buttons[2][0].data.decode().split("|")[1]
     intruder = Callback(7, f"bthumb|{batch_id}")
     await main.callback_handler(intruder)
@@ -188,7 +188,7 @@ async def main_test():
     os.remove(Path(main.THUMBNAIL_DIR, "42.jpg"))
     for i in range(2):
         await main.file_handler(file_event(42, 60 + i, f"Y{i}.pdf"))
-    await asyncio.sleep(0.6)
+    await asyncio.sleep(2.0)
     check("no thumbnail: « Set Thumbnail First (/setthumb) »", labels(sent[-1].buttons)[0].startswith("🖼️ Set Thumbnail First"))
 
     # 7. settings and history read at start-up, never overwritten by the first user after a restart

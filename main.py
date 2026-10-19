@@ -825,8 +825,8 @@ def add_custom_text_to_filename(filename, custom_text=None, position='end'):
 
     name, ext = os.path.splitext(filename)
 
-    # Nettoyer le nom du fichier SANS toucher aux emojis ou crochets
-    name = clean_filename_text(name)
+    # The @names / #tags of the name are removed by the callers when « Clean Tags » is on (they were always
+    # removed here, so turning it off did nothing as soon as a custom text was set)
 
     # NE PAS nettoyer custom_text, juste strip pour éviter les espaces
     custom_text = custom_text.strip()
@@ -1346,7 +1346,7 @@ Send me any file and I'll help you rename it.
 • Video streaming support 🎬"""
     
     if custom_text:
-        welcome_text += f"\n• Custom text: <code>{custom_text}</code>"
+        welcome_text += f"\n• Custom text: <code>{_esc(custom_text)}</code>"
     
     welcome_text += f"""
 
@@ -1388,7 +1388,12 @@ async def cancel_handler(event):
     # Ignore channels and groups
     if not event.is_private:
         return
-    
+
+    if sessions.get(user_id, {}).pop('awaiting_custom_text', None):
+        await event.reply("❌ Custom text addition cancelled.", parse_mode='html')
+        await show_settings_menu(event)
+        return
+
     if user_id in user_sessions:
         if 'temp_path' in user_sessions[user_id]:
             try:
@@ -1612,7 +1617,7 @@ async def show_settings_menu(event):
     text = "⚙️ <b>Bot Settings</b>\n\n"
     
     if custom_text:
-        text += f"📝 Custom text: <code>{custom_text}</code>\n"
+        text += f"📝 Custom text: <code>{_esc(custom_text)}</code>\n"   # a « < » in it broke the whole menu
         text += f"📍 Position: {text_position}\n"
     else:
         text += "📝 No custom text set\n"
@@ -1640,36 +1645,26 @@ async def message_handler(event):
         return
     
     user_id = event.sender_id
-    message_text = event.raw_text.strip()
-    
-    # Check if user is in a session awaiting custom text
-    if user_id in sessions and sessions[user_id].get('awaiting_custom_text'):
-        # Remove the awaiting flag
-        sessions[user_id].pop('awaiting_custom_text', None)
-        
-        # Check if this is a cancel command
-        if message_text.lower() == '/cancel':
-            await event.reply("❌ Custom text addition cancelled.", parse_mode='html')
-            await show_settings_menu(event)
-            return
-            
-        # Save the custom text
-        custom_text = message_text
-        if user_id not in sessions:
-            sessions[user_id] = {}
-        sessions[user_id]['custom_text'] = custom_text
-        save_user_preferences()
-        
-        # Confirm and show settings menu
-        await event.reply(f"✅ Custom text set to: <code>{custom_text}</code>", parse_mode='html')
-        await show_settings_menu(event)
+    message_text = (event.raw_text or "").strip()
+
+    # Telethon runs EVERY handler a message matches: /settings already has its own (this one used to show the
+    # menu a second time), /cancel too, and a file or a reply to a rename prompt is not a custom text.
+    if not (user_id in sessions and sessions[user_id].get('awaiting_custom_text')):
         return
-    
-    # Only process /settings command
-    if message_text.lower() == '/settings':
-        await show_settings_menu(event)
-    
-    # For other messages, do nothing (or handle them as needed)
+    if message_text.startswith('/'):
+        if message_text.lower() != '/cancel':           # another command: the custom text is dropped
+            sessions[user_id].pop('awaiting_custom_text', None)
+        return
+    if event.message.media or event.is_reply or not message_text:
+        return
+
+    sessions[user_id].pop('awaiting_custom_text', None)
+    sessions[user_id]['custom_text'] = message_text
+    save_user_preferences()
+
+    # Confirm and show settings menu
+    await event.reply(f"✅ Custom text set to: <code>{_esc(message_text)}</code>", parse_mode='html')
+    await show_settings_menu(event)
 
 @bot.on(events.NewMessage(pattern='/cleanup'))
 async def cleanup_handler(event):
@@ -1725,8 +1720,7 @@ async def setthumb_handler(event):
     
     message += """Requirements:
 - Must be a photo (not document)
-- Size limit: 200 KB
-- Format: JPEG/PNG
+- Any size: it is resized the way Telegram wants thumbnails (320 px)
 
 💡 <b>Tips for video thumbnails:</b>
 - Use 16:9 aspect ratio for best results
@@ -1795,35 +1789,37 @@ async def photo_handler(event):
     # Ignore channels and groups
     if not event.is_private:
         return
-        
-    # Vérifier le quota
-    ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
-        user_id=user_id,
-        daily_limit=DAILY_LIMIT,
-        tz_name=QUOTA_TZ,
-        is_admin=is_admin(user_id)
-    )
-    if not ok:
-        await event.reply(
-            f"🚫 You've used all your daily quota for today. "
-            f"Please try again after {reset_time}.",
-            parse_mode='html'
-        )
+
+    # No quota: a thumbnail is not a file to rename (every photo used to cost an action, even a stray one)
+    if not (user_id in user_sessions and user_sessions[user_id].get('action') == 'set_thumbnail'):
+        await event.reply("🖼️ To use this photo as your thumbnail, send /setthumb first, then the photo.")
         return
 
-    # Notification si quota vient d'être atteint
-    if just_hit_limit:
-        await bot.send_message(
-            user_id,
-            f"⚠️ <b>Quota Alert!</b>\n\n"
-            f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
-            f"Your quota will reset at {reset_time}.\n\n"
-            f"<i>Thank you for using the bot!</i>",
-            parse_mode='html'
-        )
-    
     # Check if user is in set_thumbnail mode
     if user_id in user_sessions and user_sessions[user_id].get('action') == 'set_thumbnail':
+        # Saved Telegram-sized (320 px, 200 KB): any photo will do. Without Pillow, the old size limit.
+        thumb_path = os.path.join(THUMBNAIL_DIR, "{}.jpg".format(user_id))
+        raw_path = os.path.join(TEMP_DIR, f"{user_id}_thumb_{uuid.uuid4().hex[:8]}")
+        try:
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            raw_path = await event.download_media(file=raw_path) or raw_path
+            if fit_thumbnail(raw_path, thumb_path):
+                await event.reply(
+                    "✅ <b>Thumbnail saved successfully!</b>\n\n"
+                    "This thumbnail will be used for all your renamed files.\n"
+                    "Use /delthumb to remove it.",
+                    parse_mode='html'
+                )
+                del user_sessions[user_id]
+                return
+        except Exception as e:
+            logging.warning(f"Thumbnail resize failed, keeping the old way: {e}")
+        finally:
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
+
         # Check size
         if event.file.size > MAX_THUMB_SIZE:
             await event.reply(
@@ -1960,33 +1956,9 @@ async def callback_handler(event):
         await _batch_callback(event, data, user_id)
         return
 
-    # Ignorer la vérification des quotas pour certaines commandes
-    if not data.startswith(('cancel|', 'no_thumb', 'show_settings', 'back_to_main', 'toggle_', 'close_')):
-        # Vérifier le quota pour les actions qui en consomment
-        ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
-            user_id=user_id,
-            daily_limit=DAILY_LIMIT,
-            tz_name=QUOTA_TZ,
-            is_admin=is_admin(user_id)
-        )
-        if not ok:
-            await event.answer(
-                f"🚫 Quota reached! Try again after {reset_time}",
-                alert=True
-            )
-            return
+    # No quota here: a file is counted once, when it arrives (file_handler). Buttons used to count too: the
+    # settings ones, « I have joined », and « Add Thumbnail » on a file already counted (4 actions per file).
 
-        # Notification si quota vient d'être atteint
-        if just_hit_limit:
-            await bot.send_message(
-                user_id,
-                f"⚠️ <b>Quota Alert!</b>\n\n"
-                f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
-                f"Your quota will reset at {reset_time}.\n\n"
-                f"<i>Thank you for using the bot!</i>",
-                parse_mode='html'
-            )
-    
     # Settings menu and existing settings options
     if data == "show_settings":
         await show_settings_menu(event)
@@ -1998,7 +1970,7 @@ async def callback_handler(event):
         current_text = sessions[user_id].get('custom_text', '')
         message = "📝 <b>Add Custom Text</b>\n\n"
         if current_text:
-            message += f"Current: <code>{current_text}</code>\n\n"
+            message += f"Current: <code>{_esc(current_text)}</code>\n\n"
         message += (
             "Send me any text to be added to your filenames.\n\n"
             "Examples:\n"
@@ -2140,152 +2112,65 @@ async def callback_handler(event):
 
 @bot.on(events.NewMessage(func=lambda e: e.is_reply and e.message.reply_to_msg_id and not e.photo))
 async def rename_reply_handler(event):
-    """Handle replies for stateless rename flows"""
+    """The new name, typed in reply to the prompt. « Add Thumbnail » and « Rename Only » both go through the
+    per-user queue: the file is downloaded and sent again under its new name. « Rename Only » used to send the
+    same Telegram file back (only the caption changed: the file kept its old name).
+    No quota here: the file was counted when it arrived (every reply used to count, even unrelated ones)."""
     user_id = event.sender_id
-    chat_id = event.chat_id
-    reply_to = await event.get_reply_message()
-    
+
     # Ignore channels and groups
     if not event.is_private:
         return
-        
-    # Vérifier le quota
-    ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
-        user_id=user_id,
-        daily_limit=DAILY_LIMIT,
-        tz_name=QUOTA_TZ,
-        is_admin=is_admin(user_id)
-    )
-    if not ok:
-        await event.reply(
-            f"🚫 You've used all your daily quota for today. "
-            f"Please try again after {reset_time}.",
-            parse_mode='html'
-        )
+    if event.message.media:                 # a file sent as a reply is a new file (file_handler)
         return
 
-    # Notification si quota vient d'être atteint
-    if just_hit_limit:
-        await bot.send_message(
-            user_id,
-            f"⚠️ <b>Quota Alert!</b>\n\n"
-            f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
-            f"Your quota will reset at {reset_time}.\n\n"
-            f"<i>Thank you for using the bot!</i>",
-            parse_mode='html'
-        )
-    
     if user_id not in user_sessions:
         return
     sess = user_sessions[user_id]
     action = sess.get('action')
     if action not in ['rename_stateless', 'thumb_stateless']:
         return
-    
+
     # Ensure reply corresponds to prompt
     if event.reply_to_msg_id != getattr(sess.get('prompt_msg'), 'id', None):
         return
-    
+
     new_name = (event.raw_text or event.text or "").strip()
     if not new_name:
         await event.reply("❌ Please provide a valid filename.")
         return
-    
-    original_msg = sess.get('original_msg')
-    if not original_msg:
+    if new_name.startswith('/'):            # a command, not a name (/cancel has its own handler)
+        return
+
+    if not sess.get('original_msg'):
         del user_sessions[user_id]
         return
-    
-    # Add extension if missing
-    if "." not in new_name:
-        original_name = original_msg.file.name or ""
-        ext = os.path.splitext(original_name)[1]
-        if ext:
-            new_name += ext
-            await event.reply(f"ℹ️ Extension added: <code>{new_name}</code>", parse_mode='html')
-    
-    # Build final name
-    sanitized_name = sanitize_filename(new_name)
-    if sessions.get(user_id, {}).get('clean_tags', True):
-        sanitized_name = clean_filename_text(sanitized_name)
-    custom_text = sessions.get(user_id, {}).get('custom_text', '')
-    text_position = sessions.get(user_id, {}).get('text_position', 'end')
-    if custom_text:
-        sanitized_name = add_custom_text_to_filename(sanitized_name, custom_text, text_position)
-    
+
+    # A self-contained snapshot for the queue (the session is cleared right away)
+    sess_copy = {
+        'action': action,
+        'original_msg': sess.get('original_msg'),
+        'stored_data': sess.get('stored_data'),
+        'storage_key': sess.get('storage_key'),
+        'timestamp': datetime.now(),
+    }
+    q = THUMB_QUEUES.setdefault(user_id, asyncio.Queue())
+    worker_active = user_id in THUMB_WORKERS and THUMB_WORKERS[user_id] and not THUMB_WORKERS[user_id].done()
+    size_before = q.qsize()
+    await q.put({'chat_id': event.chat_id, 'new_name': new_name, 'sess': sess_copy})
+    logging.info(f"[THUMB] Enqueued {action} for user {user_id}; size_before={size_before} now={q.qsize()} name={new_name}")
+    ensure_thumb_worker(user_id)
+    # Inform waiting only if there was already a job or a worker running
+    if worker_active or size_before > 0:
+        await event.reply("🕒 File queued… I will process it after the current file.")
     try:
-        if action == 'rename_stateless':
-            await safe_send_file(
-                bot,
-                event.chat_id,
-                original_msg.media,
-                caption=f"<code>{sanitized_name}</code>",
-                parse_mode='html',
-                file_name=sanitized_name,
-                supports_streaming=True,
-                force_document=not getattr(original_msg, 'video', False)
-            )
-            await event.reply("✅ File renamed successfully!")
-            # Update rename stats (best-effort)
-            try:
-                await add_rename_stat(getattr(getattr(original_msg, 'file', None), 'size', 0) or 0)
-            except Exception:
-                pass
-            
-        elif action == 'thumb_stateless':
-            # Build a minimal, self-contained session snapshot for queued processing
-            sess_copy = {
-                'action': 'thumb_stateless',
-                'original_msg': sess.get('original_msg'),
-                'stored_data': sess.get('stored_data'),
-                'storage_key': sess.get('storage_key'),
-                'timestamp': datetime.now(),
-            }
-            # Always enqueue; the worker will process immediately if this is the only job
-            q = THUMB_QUEUES.setdefault(user_id, asyncio.Queue())
-            worker_active = user_id in THUMB_WORKERS and THUMB_WORKERS[user_id] and not THUMB_WORKERS[user_id].done()
-            size_before = q.qsize()
-            await q.put({
-                'chat_id': event.chat_id,
-                'new_name': sanitized_name,
-                'sess': sess_copy,
-            })
-            logging.info(f"[THUMB] Enqueued for user {user_id}; size_before={size_before} now={q.qsize()} name={sanitized_name}")
-            ensure_thumb_worker(user_id)
-            # Inform waiting only if there was already a job or a worker running
-            if worker_active or size_before > 0:
-                await event.reply("🕒 File queued… I will process it after the current file.")
-            # Delete prompt now; worker will process immediately if this is the only job
-            try:
-                pm = sess.get('prompt_msg')
-                if pm:
-                    await pm.delete()
-            except Exception:
-                pass
-            # End early; do not fall through to cleanup that removes cache
-            if user_id in user_sessions:
-                del user_sessions[user_id]
-            return
-    except Exception as e:
-        await event.reply(f"❌ Error: {str(e)}")
-    finally:
-        # Clean up prompt message, cache entry, and clear short-lived session
-        try:
-            pm = sess.get('prompt_msg')
-            if pm:
-                await pm.delete()
-        except Exception:
-            pass
-        # Note: cache cleanup for thumbnail path is handled in worker or after immediate processing above
-        try:
-            if action == 'rename_stateless':
-                storage_key = sess.get('storage_key')
-                if storage_key:
-                    ORIGINAL_MESSAGES.pop(storage_key, None)
-        except Exception:
-            pass
-        if user_id in user_sessions:
-            del user_sessions[user_id]
+        pm = sess.get('prompt_msg')
+        if pm:
+            await pm.delete()
+    except Exception:
+        pass
+    if user_id in user_sessions:
+        del user_sessions[user_id]
 
 
 
@@ -2325,33 +2210,10 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
     stored_data = None
     storage_key = None
     batch = (sess or {}).get('batch')            # (3, 12) for the 3rd file of a group
-
-    # Vérifier le quota (a file of a group was already counted when it arrived)
-    if not (sess or {}).get('no_quota'):
-        ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
-            user_id=user_id,
-            daily_limit=DAILY_LIMIT,
-            tz_name=QUOTA_TZ,
-            is_admin=is_admin(user_id)
-        )
-        if not ok:
-            await event.reply(
-                f"🚫 You've used all your daily quota for today. "
-                f"Please try again after {reset_time}.",
-                parse_mode='html'
-            )
-            return
-
-        # Notification si quota vient d'être atteint
-        if just_hit_limit:
-            await bot.send_message(
-                user_id,
-                f"⚠️ <b>Quota Alert!</b>\n\n"
-                f"You've reached your daily quota limit of {DAILY_LIMIT} actions.\n"
-                f"Your quota will reset at {reset_time}.\n\n"
-                f"<i>Thank you for using the bot!</i>",
-                parse_mode='html'
-            )
+    # « Rename Only »: the same processing, with the file's own thumbnail instead of the user's
+    with_thumb = (sess or {}).get('action') != 'rename_stateless'
+    thumb_copy = None
+    # No quota here: every file was counted once, when it arrived
 
     try:
         # Prepare name
@@ -2385,9 +2247,8 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         except Exception:
             pass
         
-        progress_msg = await event.reply(
-            f"Processing with thumbnail... ({batch[0]}/{batch[1]})" if batch else "Processing with thumbnail...",
-            parse_mode=None)
+        doing = "Processing with thumbnail..." if with_thumb else "Renaming..."
+        progress_msg = await event.reply(f"{doing} ({batch[0]}/{batch[1]})" if batch else doing, parse_mode=None)
         
         if sess is not None:
             original_msg = sess.get('original_msg')
@@ -2419,9 +2280,21 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
         if path != temp_path:
             shutil.move(path, temp_path)
         
-        # Get the thumbnail
-        thumb_path = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
-        
+        # The thumbnail: the user's (made Telegram-sized: a bigger one is ignored), or for « Rename Only »
+        # the file's own (else the renamed file would come back without one)
+        thumb_path = None
+        if with_thumb:
+            saved = os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg")
+            if os.path.exists(saved):
+                thumb_copy = temp_path + "_thumb.jpg"
+                thumb_path = thumb_copy if fit_thumbnail(saved, thumb_copy) else saved
+        else:
+            try:
+                thumb_copy = await original_msg.download_media(file=temp_path + "_thumb.jpg", thumb=-1)
+                thumb_path = thumb_copy if thumb_copy and os.path.exists(thumb_copy) else None
+            except Exception:
+                thumb_path = None
+
         # Check/convert for compatibility if it's a video
         if is_video:
             temp_path = await ensure_video_compatibility(temp_path, progress_msg)
@@ -2431,9 +2304,10 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
             file_attributes = [DocumentAttributeFilename(sanitized_name)]
         
         # Minimal caption (just the name like rename_only)
-        caption = f"<code>{sanitized_name}</code>"
-        
-        await safe_edit(progress_msg, "Preparing upload with thumbnail...", parse_mode=None)
+        caption = f"<code>{_esc(sanitized_name)}</code>"
+
+        await safe_edit(progress_msg, "Preparing upload with thumbnail..." if with_thumb else "Preparing upload...",
+                        parse_mode=None)
         
         start_time = time.time()
         last_update_time_upload = [start_time]
@@ -2506,8 +2380,9 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
             except:
                 pass
 
-        # Delete prompt messages even on error
-        if user_id in user_sessions:
+        # Delete prompt messages even on error (legacy flow only: with a queued job, user_sessions is the prompt
+        # of the NEXT file, which this used to delete)
+        if sess is None and user_id in user_sessions:
             if 'media_info_msg' in user_sessions[user_id]:
                 try:
                     await user_sessions[user_id]['media_info_msg'].delete()
@@ -2519,6 +2394,33 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
                 except:
                     pass
             del user_sessions[user_id]
+    finally:
+        if thumb_copy and os.path.exists(thumb_copy):
+            try:
+                os.remove(thumb_copy)
+            except OSError:
+                pass
+
+
+def fit_thumbnail(src: str, dst: str) -> bool:
+    """A thumbnail Telegram takes: JPEG, at most 320×320 px and 200 KB (a bigger one is silently ignored).
+    False when Pillow is missing: the picture is then used as it is."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        with Image.open(src) as im:
+            im = im.convert("RGB")
+            im.thumbnail((320, 320))
+            for quality in (90, 80, 70, 60, 50):
+                im.save(dst, "JPEG", quality=quality, optimize=True)
+                if os.path.getsize(dst) <= MAX_THUMB_SIZE:
+                    break
+        return True
+    except Exception as e:
+        logging.warning(f"Thumbnail not resized ({src}): {e}")
+        return False
 
 # Every user's usage and settings, read once at start-up. They used to be read on the first /start
 # only: a file or a setting changed before it saved files holding that single user, and every other

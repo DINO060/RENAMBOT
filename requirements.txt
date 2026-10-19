@@ -3,3 +3,4 @@ tgcrypto
 python-dotenv
 aiosqlite>=0.20.0
 psutil
+Pillow
