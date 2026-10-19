@@ -10,7 +10,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ACCOUNTS = Path.home() / ".telegraph_accounts.json"     # never in a repo: the token edits the pages
 KEY = "renambot"
-BOT_URL = ""                     # https://t.me/<the bot> once known: shown under the title and at the end
+BOT_URL = "https://t.me/hgfyyyfTetrisbot"
 COMMIT = sys.argv[1] if len(sys.argv) > 1 else "main"
 IMG = f"https://cdn.jsdelivr.net/gh/DINO060/RENAMBOT@{COMMIT}/guide/img/"
 
