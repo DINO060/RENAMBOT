@@ -86,3 +86,13 @@ async def increment_if_under_limit(
         remaining = max(daily_limit - new_used, 0)
         just_reached_limit = (new_used >= daily_limit)
         return True, remaining, _reset_time_str(tz_name), just_reached_limit
+
+
+async def actions_used_today(user_id: int, tz_name: str = "UTC", db_path: str = DB_PATH) -> int:
+    """How many actions this user has used today (for /status)."""
+    async with aiosqlite.connect(db_path) as db:
+        await _ensure_schema(db)
+        cur = await db.execute("SELECT used FROM quotas WHERE user_id=? AND day=?", (user_id, _today_str(tz_name)))
+        row = await cur.fetchone()
+        await cur.close()
+    return int(row[0]) if row else 0

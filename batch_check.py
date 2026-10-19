@@ -18,6 +18,10 @@ sys.path.insert(0, str(WORK))
 sys.stdout.reconfigure(errors="replace")
 os.environ.update(API_ID="1", API_HASH="x", TOKEN="1:x", ADMIN_IDS="42", QUOTA_DB_PATH=str(WORK / "q.db"),
                   DAILY_LIMIT="10", QUOTA_TZ="UTC")
+# what an older user left on disk before this start (another user, never seen since the restart)
+(WORK / "user_preferences.json").write_text('{"555": {"custom_text": "@Chan", "text_position": "end", "clean_tags": true}}')
+(WORK / "user_usage.json").write_text('{"555": {"daily_bytes": 0, "last_reset": "2026-01-01T00:00:00", '
+                                      '"last_file_time": "2026-01-01T00:00:00"}}')
 
 import telethon  # noqa: E402
 
@@ -186,6 +190,32 @@ async def main_test():
         await main.file_handler(file_event(42, 60 + i, f"Y{i}.pdf"))
     await asyncio.sleep(0.6)
     check("no thumbnail: « Set Thumbnail First (/setthumb) »", labels(sent[-1].buttons)[0].startswith("🖼️ Set Thumbnail First"))
+
+    # 7. settings and history read at start-up, never overwritten by the first user after a restart
+    check("start-up: an older user's custom text is there without any /start",
+          main.sessions.get(555, {}).get("custom_text") == "@Chan")
+    import json  # noqa: PLC0415
+    saved = json.loads(Path("user_usage.json").read_text())
+    check("… and saving another user's usage keeps it", "555" in saved and "7" in saved, str(list(saved)))
+
+    # 8. /status: real numbers, the caller's own status
+    async def status_of(uid):
+        replies = []
+
+        async def reply(text, **kw):
+            replies.append(text)
+        await main.status_handler(SimpleNamespace(sender_id=uid, is_private=True, reply=reply))
+        return replies[-1]
+    text = await status_of(7)
+    print("   " + text.replace("\n", "\n   "))
+    nums = {k: int(v) for k, v in __import__("re").findall(r"• (Total|Active \(7 days\)|Inactive \(7\+ days\)): (\d+)", text)}
+    check("status: the users add up (active 7 days + inactive = total)",
+          nums.get("Active (7 days)", -1) + nums.get("Inactive (7+ days)", -1) == nums.get("Total"), str(nums))
+    check("… users who just used the bot are active", nums.get("Active (7 days)", 0) >= 2, str(nums))
+    check("… the caller's own status (thumbnail, custom text, today's quota), no leftover « Captions »",
+          "Thumbnail: ✅ set" in text and "Custom text: none" in text and "Today: 5 / 10 actions" in text
+          and "Captions" not in text and "Aᴄᴛɪᴠᴇ Jᴏʙs" in text)
+    check("… an admin: unlimited", "unlimited (admin)" in await status_of(42))
     print("\nALL OK" if ok else "\nFAILED")
 
 

@@ -20,7 +20,8 @@ from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import SendMessageTypingAction, SendMessageUploadDocumentAction
 from telethon.tl.functions.channels import GetParticipantRequest
 import logging
-from utils.quota import increment_if_under_limit
+from utils.quota import actions_used_today, increment_if_under_limit
+from html import escape as _esc
 from dotenv import load_dotenv
 
 # Load environment variables from .env if present
@@ -942,6 +943,15 @@ def update_user_usage(user_id, file_size):
     user_usage[user_id]['last_file_time'] = datetime.now().isoformat()
     save_user_usage()
 
+
+def mark_seen(user_id):
+    """The user just used the bot (a file, /start, a button): /status counts active users from this."""
+    try:
+        user_usage[user_id]['last_seen'] = datetime.now().isoformat()
+        save_user_usage()
+    except Exception as e:
+        logging.error(f"mark_seen failed: {e}")
+
 def get_user_usage_info(user_id):
     """Returns user usage information"""
     reset_daily_usage_if_needed(user_id)
@@ -1315,12 +1325,8 @@ async def start_handler(event):
         await send_force_join_message(event, missing)
         return
     
-    # Load data if not already done
-    if not hasattr(start_handler, 'data_loaded'):
-        load_user_usage()
-        load_user_preferences()
-        start_handler.data_loaded = True
-    
+    mark_seen(user_id)
+
     # Get usage information
     usage_info = get_user_usage_info(user_id)
     
@@ -1400,7 +1406,12 @@ async def status_handler(event):
     # Ignore channels and groups
     if not event.is_private:
         return
-    active_sessions = len(PROCESSING_LOCKS)
+    user_id = event.sender_id
+    mark_seen(user_id)
+    # Work going on right now: files waiting for / getting a thumbnail, groups of files still arriving
+    active_jobs = (sum(q.qsize() for q in THUMB_QUEUES.values())
+                   + sum(1 for t in THUMB_WORKERS.values() if t and not t.done())
+                   + sum(len(v) for v in PENDING_FILES.values()) + UPLOAD_QUEUE.qsize())
 
     # Ping
     start = perf_counter()
@@ -1447,50 +1458,24 @@ async def status_handler(event):
         total_renamed = 0
         total_storage_used = 0.0
 
-    # User statistics
-    total_users = 0
-    active_1h = 0
-    active_24h = 0
-    active_7d = 0
-    inactive_7d = 0
-    custom_captions = 0
-
+    # User statistics: everyone the bot knows (usage, settings, quota) — active = seen lately
+    active_1h = active_24h = active_7d = 0
+    all_users = set()
     try:
         now = datetime.now()
-        all_users = set()
-
-        # Count users from user_usage.json
-        if os.path.exists(usage_file):
-            with open(usage_file, 'r') as f:
-                data = json.load(f)
-                all_users.update(int(uid) for uid in data.keys())
-                for uid_str, usage_data in data.items():
-                    last_file_time = usage_data.get('last_file_time')
-                    if last_file_time:
-                        try:
-                            last_time = datetime.fromisoformat(last_file_time)
-                            diff = (now - last_time).total_seconds()
-                            if diff <= 3600:  # 1 hour
-                                active_1h += 1
-                            if diff <= 86400:  # 24 hours
-                                active_24h += 1
-                            if diff <= 604800:  # 7 days
-                                active_7d += 1
-                            else:
-                                inactive_7d += 1
-                        except Exception:
-                            pass
-
-        # Count users from user_preferences.json
-        if os.path.exists('user_preferences.json'):
-            with open('user_preferences.json', 'r') as f:
-                data = json.load(f)
-                all_users.update(int(uid) for uid in data.keys())
-                for uid_str, pref_data in data.items():
-                    if pref_data.get('custom_text'):
-                        custom_captions += 1
-
-        # Load from quota database
+        for uid, usage_data in list(user_usage.items()):
+            all_users.add(int(uid))
+            seen = usage_data.get('last_seen') or usage_data.get('last_file_time')
+            if not seen:
+                continue
+            try:
+                diff = (now - datetime.fromisoformat(seen)).total_seconds()
+            except Exception:
+                continue
+            active_1h += diff <= 3600
+            active_24h += diff <= 86400
+            active_7d += diff <= 604800
+        all_users.update(int(uid) for uid in sessions.keys())
         try:
             import aiosqlite
             db_path = os.getenv("QUOTA_DB_PATH", "quota.db")
@@ -1502,11 +1487,25 @@ async def status_handler(event):
                     all_users.update(row[0] for row in rows)
         except Exception as e:
             logging.warning(f"Could not load users from quota DB: {e}")
-
-        total_users = len(all_users)
-
     except Exception as e:
         logging.error(f"Error calculating user stats: {e}")
+    total_users = len(all_users)
+    inactive_7d = max(0, total_users - active_7d)      # the rest: not seen for 7 days (or never since tracking)
+
+    # The caller's own status
+    has_thumb = os.path.exists(os.path.join(THUMBNAIL_DIR, f"{user_id}.jpg"))
+    prefs = sessions.get(user_id, {})
+    custom = prefs.get('custom_text', '')
+    try:
+        used_today = await actions_used_today(user_id, QUOTA_TZ)
+    except Exception:
+        used_today = None
+    if is_admin(user_id):
+        quota_line = "unlimited (admin)"
+    elif used_today is None:
+        quota_line = f"? / {DAILY_LIMIT}"
+    else:
+        quota_line = f"{used_today} / {DAILY_LIMIT} actions"
 
     # Force join channels
     force_channels = get_forced_channels()
@@ -1516,7 +1515,7 @@ async def status_handler(event):
         "⌬ BOT STATISTICS :\n\n"
         f"┎ Bᴏᴛ Uᴘᴛɪᴍᴇ : {uptime_str()}\n"
         f"┃ Cᴜʀʀᴇɴᴛ Pɪɴɢ : {ping_ms:.3f}ms\n"
-        f"┖ Aᴄᴛɪᴠᴇ Sᴇssɪᴏɴs: {active_sessions}\n\n"
+        f"┖ Aᴄᴛɪᴠᴇ Jᴏʙs : {active_jobs}\n\n"
         f"┎ RAM ( MEMORY ):\n"
         f"┖ {ram_line}\n\n"
         f"┎ CPU ( USAGE ) :\n"
@@ -1526,19 +1525,16 @@ async def status_handler(event):
         f"┃ Files renamed : {total_renamed}\n"
         f"┖ Storage used : {format_bytes(total_storage_used)}\n\n"
         f"👤 Your status\n"
-        f"• Captions: {custom_captions}\n"
-        f"• Active: none\n\n"
+        f"• Thumbnail: {'✅ set' if has_thumb else '❌ none (/setthumb)'}\n"
+        f"• Custom text: {('<code>' + _esc(custom) + '</code> (' + prefs.get('text_position', 'end') + ')') if custom else 'none'}\n"
+        f"• Today: {quota_line}\n\n"
         f"👥 Users:\n"
         f"• Total: {total_users}\n"
         f"• Active (1 hour): {active_1h}\n"
         f"• Active (24 hours): {active_24h}\n"
         f"• Active (7 days): {active_7d}\n"
         f"• Inactive (7+ days): {inactive_7d}\n\n"
-        f"🛡 System\n"
-        f"• Files: {total_renamed}\n"
-        f"• Storage: {format_bytes(total_storage_used)}\n"
-        f"• Force: {force_status}\n"
-        f"• Uptime: {uptime_str()}\n"
+        f"🛡 Force join: {force_status}\n"
     )
     await event.reply(text, parse_mode='html')
 
@@ -1908,6 +1904,7 @@ async def file_handler(event):
     if not ok:
         await send_force_join_message(event, missing)
         return
+    mark_seen(user_id)
     
     file = event.file
     file_size_bytes = int(file.size) if getattr(file, 'size', None) else 0
@@ -1956,6 +1953,7 @@ async def callback_handler(event):
     """Stateless handler for inline buttons and settings"""
     data = event.data.decode('utf-8')
     user_id = event.query.user_id
+    mark_seen(user_id)
 
     # A group of files: each one was already counted when it arrived
     if data.startswith(('bthumb|', 'bone|', 'bcancel|')):
@@ -2521,6 +2519,12 @@ async def process_with_thumbnail(event, user_id, new_name, sess=None):
                 except:
                     pass
             del user_sessions[user_id]
+
+# Every user's usage and settings, read once at start-up. They used to be read on the first /start
+# only: a file or a setting changed before it saved files holding that single user, and every other
+# user's settings and history were lost (and custom texts weren't applied until someone sent /start).
+load_user_usage()
+load_user_preferences()
 
 # Ajoutez ce code à la fin du fichier, après toutes les fonctions
 if __name__ == '__main__':
