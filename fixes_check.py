@@ -11,6 +11,7 @@ handler whose filter matches it, the way Telethon does.
 - a queued file that fails doesn't wipe the prompt of the next file.
 """
 import asyncio
+import time
 import os
 import shutil
 import sqlite3
@@ -74,6 +75,9 @@ class FakeClient:
 
     async def edit_message(self, *a, **k):
         pass
+
+    async def delete_messages(self, chat, ids, **k):
+        sent.append(SimpleNamespace(kind="deleted", chat=chat, ids=list(ids), text="", buttons=None, reply_to=None))
 
     async def __call__(self, *a, **k):
         return None
@@ -334,6 +338,17 @@ async def main_test():
     check("… restarted again with no new version: users told nothing, the admin still told",
           not [s for s in since(mark) if "has been updated" in s.text]
           and any(s.chat == 42 and "No new version" in s.text for s in since(mark)))
+    pending = main._pending_updates()
+    check("the update notice: each one due for deletion in 6 h (kept on disk, a restart doesn't lose it)",
+          sorted(r[0] for r in pending) == sorted(users) and all(5.9 * 3600 < r[2] - time.time() <= 6 * 3600 for r in pending)
+          and "disappears in 6 h" in news[0].text, str(pending))
+    check("… not deleted before its time", await main.delete_due_updates() == 0)
+    main._save_pending_updates([[c, m, time.time() - 1] for c, m, _ in pending])      # 6 h later
+    mark = len(sent)
+    n = await main.delete_due_updates()
+    gone = sorted(s.chat for s in since(mark) if s.kind == "deleted")
+    check("… after 6 h: deleted for every user, nothing left to do", n == len(users) and gone == sorted(users)
+          and main._pending_updates() == [], f"{n} {gone}")
 
     from telethon.errors import FloodWaitError  # noqa: PLC0415
     tries = {"n": 0}

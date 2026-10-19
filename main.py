@@ -819,14 +819,17 @@ async def all_user_ids() -> set:
     return users
 
 
-async def send_to_all(user_ids, text: str) -> dict:
-    """One message to each user, paced; a flood wait is waited for (it used to count the user as failed)."""
+async def send_to_all(user_ids, text: str, sent: list = None) -> dict:
+    """One message to each user, paced; a flood wait is waited for (it used to count the user as failed).
+    sent: gets (user, message id) of each message sent."""
     counts = {"sent": 0, "blocked": 0, "failed": 0}
     for uid in user_ids:
         for attempt in range(2):
             try:
-                await bot.send_message(uid, text, parse_mode='html', link_preview=False)
+                msg = await bot.send_message(uid, text, parse_mode='html', link_preview=False)
                 counts["sent"] += 1
+                if sent is not None and msg is not None:
+                    sent.append((uid, msg.id))
                 break
             except FloodWaitError as e:
                 if attempt or e.seconds > 300:
@@ -848,6 +851,45 @@ async def send_to_all(user_ids, text: str) -> dict:
 # start-up; a plain restart (crash, deploy without a new entry) tells users nothing, only the admins.
 WHATS_NEW_FILE = BASE_DIR / "whatsnew.txt"
 ANNOUNCED_FILE = BASE_DIR / "data" / "announced_version.txt"
+# The update notice deletes itself after a while (the owner's wish), even across a restart: what is due is on disk
+UPDATE_MESSAGE_TTL = 6 * 3600
+UPDATE_MESSAGES_FILE = BASE_DIR / "data" / "update_messages.json"
+
+
+def _pending_updates() -> list:
+    try:
+        return json.loads(UPDATE_MESSAGES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+
+
+def _save_pending_updates(rows: list) -> None:
+    UPDATE_MESSAGES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    UPDATE_MESSAGES_FILE.write_text(json.dumps(rows), encoding="utf-8")
+
+
+async def delete_due_updates() -> int:
+    """Deletes the update notices whose time is up; returns how many."""
+    now = time.time()
+    due = [r for r in _pending_updates() if r[2] <= now]
+    for chat_id, msg_id, _ in due:
+        try:
+            await bot.delete_messages(chat_id, [msg_id])
+        except Exception as e:
+            logging.debug(f"update notice {chat_id}/{msg_id} not deleted: {e}")
+        await asyncio.sleep(0.05)
+    if due:          # read again: notices sent meanwhile are kept
+        _save_pending_updates([r for r in _pending_updates() if r[2] > now])
+    return len(due)
+
+
+async def update_cleanup_loop():
+    while True:
+        try:
+            await delete_due_updates()
+        except Exception as e:
+            logging.warning(f"update notice cleanup: {e}")
+        await asyncio.sleep(60)
 # The Telegraph guide (guide/telegraph_pages.py), linked from /help, /start and the update message
 GUIDE_EN = "https://telegra.ph/Rename-Bot--How-to-use-it-10-19"
 GUIDE_FR = "https://telegra.ph/Rename-Bot--Mode-demploi-10-19"
@@ -875,6 +917,7 @@ def update_message(changes) -> str:
     text = "🆕 <b>RƐNAM BOT has been updated!</b>\n\n<b>What's new:</b>\n"
     text += "\n".join(f"• {_esc(c)}" for c in changes)
     text += f"\n\n📖 <a href=\"{GUIDE_EN}\">How to use the bot</a> · <a href=\"{GUIDE_FR}\">Mode d'emploi</a>"
+    text += f"\n\n<i>🕒 This message disappears in {UPDATE_MESSAGE_TTL // 3600} h.</i>"
     return text
 
 
@@ -891,7 +934,10 @@ async def announce_update():
     if is_new:
         ANNOUNCED_FILE.parent.mkdir(parents=True, exist_ok=True)
         ANNOUNCED_FILE.write_text(version, encoding="utf-8")    # first: a crash midway never sends it twice
-        counts = await send_to_all(await all_user_ids(), update_message(changes))
+        sent = []
+        counts = await send_to_all(await all_user_ids(), update_message(changes), sent)
+        delete_at = time.time() + UPDATE_MESSAGE_TTL
+        _save_pending_updates(_pending_updates() + [[uid, mid, delete_at] for uid, mid in sent])
         logging.info(f"Update {version} announced: {counts}")
     note = (f"🔄 <b>RƐNAM BOT restarted</b> (version {_esc(version or '?')}).\n"
             + (f"🆕 Update announced to users: {counts['sent']} sent, {counts['blocked']} blocked, "
@@ -2618,6 +2664,7 @@ if __name__ == '__main__':
         with bot:
             print("✅ Bot is running! Press Ctrl+C to stop.")
             bot.loop.create_task(announce_update())      # a new version → every user told once
+            bot.loop.create_task(update_cleanup_loop())  # … and that message deleted after UPDATE_MESSAGE_TTL
             bot.loop.create_task(auto_cleanup_task())    # it was never started: leftovers piled up in temp_files
             bot.run_until_disconnected()
     except Exception as e:
