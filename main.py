@@ -259,46 +259,81 @@ async def save_fj_channels(channels: list) -> None:
     _ensure_fj_file()
     FJ_PATH.write_text(json.dumps({"channels": channels}, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def channel_entry(ch):
+    """A forced channel as (ref, url, label): ref is what Telegram is asked (a username, or a -100… id as an int: as
+    text Telegram took it for a username and nobody could pass), url the Join link (t.me/name, or the invite link of a
+    private one), label what users see. Accepts "@name", "name", "t.me/name", "-100…" or
+    {"id"/"username", "invite", "title"}; None for an empty or unreadable one."""
+    if isinstance(ch, str) and ch.strip().startswith("{"):
+        try:                                     # a private channel saved as text by an older version
+            import ast
+            ch = ast.literal_eval(ch.strip())
+        except Exception:
+            return None
+    if isinstance(ch, dict):
+        cid, user = ch.get("id"), str(ch.get("username") or "").strip().lstrip("@")
+        try:
+            ref = int(cid) if cid not in (None, "") else (user or None)
+        except (TypeError, ValueError):
+            ref = user or None
+        if ref is None:
+            return None
+        url = ch.get("invite") or (f"https://t.me/{user}" if user else None)
+        return ref, url, ch.get("title") or (f"@{user}" if user else str(cid))
+    s = re.sub(r"^(https?://)?(www\.)?(t\.me|telegram\.me)/", "", str(ch).strip()).strip("/").lstrip("@").lstrip("#")
+    if not s:
+        return None
+    if re.fullmatch(r"-?\d+", s):
+        return int(s), None, s
+    return s, f"https://t.me/{s}", f"@{s}"
+
+
 def get_forced_channels() -> list:
-    """Get list of forced channels"""
-    data = _load_json(FJ_PATH, {"channels": []})
-    chans = []
-    for ch in data.get("channels", []):
-        c = str(ch).strip().lstrip("@").lstrip("#")
-        if c and c not in chans:
-            chans.append(c)
-    data["channels"] = chans
-    _save_json(FJ_PATH, data)
-    return chans
+    """The channels as written in force_join_channels.json (texts, or dicts for a private channel). It used to
+    rewrite the file on every call, turning a private channel's dict into unusable text."""
+    return list(_load_json(FJ_PATH, {"channels": []}).get("channels", []) or [])
+
+
+def forced_channel_entries() -> list:
+    """The channels really checked: the file's, or FORCE_JOIN_CHANNEL when it lists none."""
+    raw = get_forced_channels() or ([FORCE_JOIN_CHANNEL] if FORCE_JOIN_CHANNEL else [])
+    out, seen = [], set()
+    for ch in raw:
+        e = channel_entry(ch)
+        if e and e[0] not in seen:
+            seen.add(e[0])
+            out.append(e)
+    return out
+
 
 def set_forced_channels(channels: list):
     """Set forced channels list"""
-    norm = []
-    for ch in channels:
-        c = str(ch).strip().lstrip("@").lstrip("#")
-        if c and c not in norm:
-            norm.append(c)
-    _save_json(FJ_PATH, {"channels": norm})
+    _save_json(FJ_PATH, {"channels": list(channels)})
+
 
 def add_forced_channels(channels: list) -> list:
-    """Add channels to forced list"""
-    current = set(get_forced_channels())
+    """Add channels to forced list (a private channel's dict is kept as it is)"""
+    current = get_forced_channels()
+    known = {e[0] for e in map(channel_entry, current) if e}
     for ch in channels:
-        c = str(ch).strip().lstrip("@").lstrip("#")
-        if c:
-            current.add(c)
-    set_forced_channels(list(current))
-    return get_forced_channels()
+        e = channel_entry(ch)
+        if e and e[0] not in known:
+            known.add(e[0])
+            current.append(f"@{e[0]}" if isinstance(e[0], str) else str(e[0]))
+    set_forced_channels(current)
+    return current
+
 
 def del_forced_channels(channels: list) -> list:
     """Remove channels from forced list"""
-    current = set(get_forced_channels())
-    for ch in channels:
-        c = str(ch).strip().lstrip("@").lstrip("#")
-        if c in current:
-            current.remove(c)
-    set_forced_channels(list(current))
-    return get_forced_channels()
+    drop = {e[0] for e in map(channel_entry, channels) if e}
+    current = [c for c in get_forced_channels() if (channel_entry(c) or (None,))[0] not in drop]
+    set_forced_channels(current)
+    return current
+
+
+def channel_labels(channels) -> str:
+    return "\n".join(f"• {e[2]}" for e in map(channel_entry, channels) if e)
 
 def _load_json(path, default):
     """Load JSON file"""
@@ -592,41 +627,80 @@ def get_local_file_path(user_id, file_id, extension):
     return os.path.join(user_dir, f"{file_id}{extension}")
 
 # 🔥 FORCE JOIN CHANNEL FUNCTIONS 🔥 (multi-channel)
+MEMBER_CACHE_SECONDS = 600           # a member stays « joined » this long without asking Telegram again
+CONFIG_ALERT_EVERY = 6 * 3600        # a channel the bot can't check is reported to the admins this often
+_joined_until = {}
+_alerted_at = {}
+
+
+async def _alert_admins(label: str, why: str) -> None:
+    """A channel the bot can't check: users are let through (they used to be ALL locked out, silently)."""
+    if time.time() - _alerted_at.get(label, 0) < CONFIG_ALERT_EVERY:
+        return
+    _alerted_at[label] = time.time()
+    text = (f"⚠️ <b>Force join:</b> I can't check who is in {_esc(str(label))} ({_esc(why)}).\n\n"
+            "Until this is fixed, users are NOT checked for this channel.\n"
+            "Fix: make this bot an administrator of the channel (or correct it with /delfsub + /addfsub), "
+            "then /channels to verify.")
+    for admin in ADMIN_SET:
+        try:
+            await bot.send_message(admin, text, parse_mode='html')
+        except Exception as e:
+            logging.warning(f"Force join alert to {admin} failed: {e}")
+
+
+async def channel_problem(ref):
+    """None when the bot can check the members of this channel, else why not (it must be an admin there)."""
+    from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator, InputUserSelf
+    from telethon.errors import ChatAdminRequiredError
+    try:
+        res = await bot(GetParticipantRequest(channel=ref, participant=InputUserSelf()))
+        part = getattr(res, "participant", None)
+        if part is None or isinstance(part, (ChannelParticipantAdmin, ChannelParticipantCreator)):
+            return None
+        return "I'm not an administrator there"
+    except (UserNotParticipantError, ChatAdminRequiredError, ChannelPrivateError):
+        return "I'm not an administrator there"
+    except Exception as e:
+        return f"{type(e).__name__}: this channel can't be found"
+
+
 async def is_user_in_required_channels(user_id):
-    """Return (ok, missing_list). Admins bypass. If no JSON channels, fallback to FORCE_JOIN_CHANNEL."""
+    """(ok, missing entries). Admins bypass. A member is remembered 10 min (every file used to ask Telegram again).
+    A channel the bot can't check lets users through and alerts the admins; a network error lets them through."""
+    from telethon.errors import (ChannelInvalidError, ChatAdminRequiredError, UsernameInvalidError,
+                                 UsernameNotOccupiedError)
     if user_id in ADMIN_SET:
         return True, []
-    channels = get_forced_channels()
-    if not channels:
-        # Fallback to single channel config if set
-        channels = [FORCE_JOIN_CHANNEL] if FORCE_JOIN_CHANNEL else []
-        if not channels:
-            return True, []
+    entries = forced_channel_entries()
+    if not entries or _joined_until.get(user_id, 0) > time.time():
+        return True, []
     missing = []
-    for ch in channels:
+    for entry in entries:
+        ref, _url, label = entry
         try:
-            await bot(GetParticipantRequest(channel=ch, participant=user_id))
+            await bot(GetParticipantRequest(channel=ref, participant=user_id))
         except UserNotParticipantError:
-            missing.append(ch)
-        except ChannelPrivateError:
-            logging.error(f"No access to channel {ch}")
-            missing.append(ch)
+            missing.append(entry)
+        except (ChatAdminRequiredError, ChannelPrivateError):
+            await _alert_admins(label, "I'm not an administrator there")
+        except (ValueError, UsernameNotOccupiedError, UsernameInvalidError, ChannelInvalidError) as e:
+            await _alert_admins(label, f"this channel can't be found: {type(e).__name__}")
         except Exception as e:
-            logging.error(f"Channel verification error for {ch}: {e}")
-            missing.append(ch)
-    return (len(missing) == 0), missing
+            logging.error(f"Channel verification error for {label}: {e}")
+    if not missing:
+        _joined_until[user_id] = time.time() + MEMBER_CACHE_SECONDS
+    return not missing, missing
+
 
 async def send_force_join_message(event, missing_channels=None):
     """Sends the message asking the user to join required channels"""
-    channels = missing_channels or get_forced_channels() or ([FORCE_JOIN_CHANNEL] if FORCE_JOIN_CHANNEL else [])
-    buttons = []
-    for ch in channels:
-        label = ch if str(ch).startswith('@') else f"{ch}"
-        url = f"https://t.me/{label.lstrip('@')}"
-        buttons.append([Button.url(f"📢 Join {label}", url)])
+    entries = [e if isinstance(e, tuple) else channel_entry(e) for e in (missing_channels or forced_channel_entries())]
+    entries = [e for e in entries if e]
+    buttons = [[Button.url(f"📢 Join {label}", url)] for _ref, url, label in entries if url]
     buttons.append([cbtn("✅ I have joined", "check_joined", "success")])
 
-    links = "\n".join(f"• {ch}" for ch in channels)
+    links = "\n".join(f"• {_esc(str(label))}" for _ref, _url, label in entries)
     message = (
         "🚫 <b>Access Denied!</b>\n\n"
         "To use this bot, you must first join these channels:\n"
@@ -690,7 +764,8 @@ async def addfsub_cmd(event):
     raw = re.split(r"[,\s]+", parts[1].strip())
     chans = [x for x in (s.lstrip("@").lstrip("#") for s in raw) if x]
     new_list = add_forced_channels(chans)
-    await event.reply("✅ Forced-sub channels updated:\n" + "\n".join(f"• @{c}" for c in new_list))
+    await event.reply("✅ Forced-sub channels updated:\n" + channel_labels(new_list)
+                      + "\n\nCheck with /channels that I can verify them (I must be an admin there).")
 
 
 @bot.on(events.NewMessage(pattern=r"/delfsub(?:\s+.*)?"))
@@ -703,15 +778,17 @@ async def delfsub_cmd(event):
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         set_forced_channels([])
-        await event.reply("✅ All forced-sub channels removed.")
+        await event.reply("✅ All forced-sub channels removed."
+                          + (f"\nThe default one still applies: @{FORCE_JOIN_CHANNEL}." if FORCE_JOIN_CHANNEL else ""))
         return
     raw = re.split(r"[,\s]+", parts[1].strip())
     chans = [x for x in (s.lstrip("@").lstrip("#") for s in raw) if x]
     new_list = del_forced_channels(chans)
     if new_list:
-        await event.reply("✅ Remaining forced-sub channels:\n" + "\n".join(f"• @{c}" for c in new_list))
+        await event.reply("✅ Remaining forced-sub channels:\n" + channel_labels(new_list))
     else:
-        await event.reply("✅ No forced-sub channels configured.")
+        await event.reply("✅ No forced-sub channels configured."
+                          + (f"\nThe default one still applies: @{FORCE_JOIN_CHANNEL}." if FORCE_JOIN_CHANNEL else ""))
 
 
 @bot.on(events.NewMessage(pattern='/ping'))
@@ -795,7 +872,7 @@ def whats_new():
 
 
 def update_message(changes) -> str:
-    text = "🆕 <b>Rename Bot has been updated!</b>\n\n<b>What's new:</b>\n"
+    text = "🆕 <b>RƐNAM BOT has been updated!</b>\n\n<b>What's new:</b>\n"
     text += "\n".join(f"• {_esc(c)}" for c in changes)
     text += f"\n\n📖 <a href=\"{GUIDE_EN}\">How to use the bot</a> · <a href=\"{GUIDE_FR}\">Mode d'emploi</a>"
     return text
@@ -816,9 +893,12 @@ async def announce_update():
         ANNOUNCED_FILE.write_text(version, encoding="utf-8")    # first: a crash midway never sends it twice
         counts = await send_to_all(await all_user_ids(), update_message(changes))
         logging.info(f"Update {version} announced: {counts}")
-    note = (f"🔄 <b>Rename bot restarted</b> (version {_esc(version or '?')}).\n"
+    note = (f"🔄 <b>RƐNAM BOT restarted</b> (version {_esc(version or '?')}).\n"
             + (f"🆕 Update announced to users: {counts['sent']} sent, {counts['blocked']} blocked, "
                f"{counts['failed']} failed." if counts else "No new version: users were not told."))
+    for ref, _url, label in forced_channel_entries():
+        problem = await channel_problem(ref)
+        note += f"\n📢 Force join {_esc(str(label))}: " + ("✅ checked" if not problem else f"❌ NOT checked ({_esc(problem)})")
     for admin in ADMIN_SET:
         try:
             await bot.send_message(admin, note, parse_mode='html')
@@ -881,11 +961,16 @@ async def channels_cmd(event):
     if not is_admin(user_id):
         await event.reply("🚫 Admins only.")
         return
-    chans = get_forced_channels()
-    if not chans:
+    entries = forced_channel_entries()
+    if not entries:
         await event.reply("ℹ️ No forced-sub channels configured.")
         return
-    await event.reply("📋 Forced-sub channels:\n" + "\n".join(f"• @{c}" for c in chans))
+    lines = []
+    for ref, _url, label in entries:              # can the bot really check each one? (it must be an admin)
+        problem = await channel_problem(ref)
+        lines.append(f"• {label} — " + ("✅ checked (I'm an admin)" if not problem else f"❌ NOT checked: {problem}"))
+    default = "" if get_forced_channels() else "\n\n(the default channel: none added with /addfsub)"
+    await event.reply("📋 Forced-sub channels:\n" + "\n".join(lines) + default)
 
 def clean_filename_text(text):
     """Cleans the text by removing all @usernames and hashtags"""
@@ -1387,8 +1472,11 @@ async def check_joined_handler(event):
     if ok:
         await event.answer("✅ Thank you! You can now use the bot.", alert=True)
         await event.delete()
-        # Show welcome message
-        await bot.send_message(user_id, "/start")
+        # A real welcome (the bot used to send the text « /start », which does nothing)
+        await bot.send_message(
+            user_id,
+            "✅ <b>You're in!</b>\n\n📤 Send me a file to rename it.\n📖 /help — how to use the bot, with pictures.",
+            parse_mode='html', buttons=[[cbtn("⚙️ Settings", "show_settings", "primary"), Button.url("📖 Guide", GUIDE_EN)]])
     else:
         await event.answer("❌ You haven't joined all channels yet!", alert=True)
 
@@ -1414,7 +1502,7 @@ async def start_handler(event):
     # Check if user has a custom text
     custom_text = sessions.get(user_id, {}).get('custom_text', '')
     
-    welcome_text = """👋 <b>Welcome to Advanced File Rename Bot!</b>
+    welcome_text = """👋 <b>Welcome to RƐNAM BOT!</b>
 
 Send me any file and I'll help you rename it.
 
@@ -1470,7 +1558,7 @@ async def help_handler(event):
     if not event.is_private:
         return
     await event.reply(
-        "📖 <b>How to use Rename Bot</b>\n\nEverything the bot does, step by step, with pictures and a short video.",
+        "📖 <b>How to use RƐNAM BOT</b>\n\nEverything the bot does, step by step, with pictures and a short video.",
         parse_mode='html',
         buttons=[[Button.url("📖 Guide (English)", GUIDE_EN)], [Button.url("📖 Mode d'emploi (Français)", GUIDE_FR)]])
 
@@ -1607,7 +1695,7 @@ async def status_handler(event):
         quota_line = f"{used_today} / {DAILY_LIMIT} actions"
 
     # Force join channels
-    force_channels = get_forced_channels()
+    force_channels = forced_channel_entries()     # the default channel counts: it is checked
     force_status = f"ON ({len(force_channels)})" if force_channels else "OFF"
 
     text = (
@@ -1962,7 +2050,13 @@ async def file_handler(event):
     # Ignore channels and groups
     if not event.is_private:
         return
-    
+
+    # Force-join first: a refused file used to cost an action of the quota
+    ok, missing = await is_user_in_required_channels(user_id)
+    if not ok:
+        await send_force_join_message(event, missing)
+        return
+
     # Vérifier le quota
     ok, remaining, reset_time, just_hit_limit = await increment_if_under_limit(
         user_id=user_id,
@@ -1988,12 +2082,6 @@ async def file_handler(event):
             f"<i>Thank you for using the bot!</i>",
             parse_mode='html'
         )
-    
-    # Force-join
-    ok, missing = await is_user_in_required_channels(user_id)
-    if not ok:
-        await send_force_join_message(event, missing)
-        return
     mark_seen(user_id)
     
     file = event.file

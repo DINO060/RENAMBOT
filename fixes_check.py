@@ -369,6 +369,71 @@ async def main_test():
           styles["🖼️ Add Thumbnail"]["bg_success"] and styles["✏️ Rename Only"]["bg_primary"]
           and styles["❌ Cancel"]["bg_danger"], str(styles))
 
+    # 9. force join (last: from here on, channels are required)
+    import json  # noqa: PLC0415
+    from telethon.errors import ChatAdminRequiredError, UserNotParticipantError  # noqa: PLC0415
+    from telethon.tl.functions.channels import GetParticipantRequest  # noqa: PLC0415
+    from telethon.tl.types import InputUserSelf  # noqa: PLC0415
+    fj = {"members": set(), "not_admin": set(), "asked": 0}
+
+    async def telegram(self, req, *a, **k):
+        if isinstance(req, GetParticipantRequest):
+            fj["asked"] += 1
+            if req.channel in fj["not_admin"]:
+                raise ChatAdminRequiredError(None)
+            if isinstance(req.participant, InputUserSelf) or (req.channel, req.participant) in fj["members"]:
+                return SimpleNamespace(participant=None)
+            raise UserNotParticipantError(None)
+        return None
+    FakeClient.__call__ = telegram
+    channels = ["@chanA", "-100123", {"id": -100777, "title": "Private club", "invite": "https://t.me/+abc"}]
+    main.FJ_PATH.write_text(json.dumps({"channels": channels}))
+    main._joined_until.clear()
+    refs = [e[0] for e in main.forced_channel_entries()]
+    check("channels: @name, a -100 id (as a number, else nobody could pass), a private one with its invite",
+          refs == ["chanA", -100123, -100777], str(refs))
+
+    before = quota_used(50)
+    mark = len(sent)
+    await dispatch(message_event(50, file="x.pdf"))
+    denied = [s for s in since(mark) if "Access Denied" in s.text]
+    urls = [getattr(b, "url", None) for row in (denied[-1].buttons if denied else []) for b in row]
+    check("not a member: refused, Join buttons for @chanA and the private invite, the file costs nothing",
+          denied and "https://t.me/chanA" in urls and "https://t.me/+abc" in urls and quota_used(50) == before,
+          f"{urls} {quota_used(50) - before}")
+
+    fj["members"] |= {("chanA", 50), (-100123, 50), (-100777, 50)}
+    mark = len(sent)
+    await dispatch(Callback(50, "check_joined"))
+    check("« I have joined » after joining: a real welcome (it sent the text « /start »)",
+          any("You're in" in s.text for s in since(mark)) and not any(s.text == "/start" for s in since(mark)))
+    asked = fj["asked"]
+    await dispatch(message_event(50, file="y.pdf"))
+    await dispatch(message_event(50, file="z.pdf"))
+    check("a member: remembered, Telegram not asked again for each file", fj["asked"] == asked)
+    await asyncio.sleep(0.8)
+
+    fj["not_admin"].add(-100123)
+    fj["members"] |= {(ch, u) for ch in ("chanA", -100777) for u in (51, 52)}   # members of the checkable ones
+    main._joined_until.clear()
+    mark = len(sent)
+    await dispatch(message_event(51, "/settings"))
+    await dispatch(message_event(52, "/settings"))
+    alerts = [s for s in since(mark) if s.chat == 42 and "can't check" in s.text]
+    check("bot not admin of a channel: users not locked out (they ALL were), the admin alerted once",
+          len(alerts) == 1 and not [s for s in since(mark) if "Access Denied" in s.text]
+          and len([s for s in since(mark) if "Bot Settings" in s.text]) == 2, str([s.text[:50] for s in since(mark)]))
+    mark = len(sent)
+    await dispatch(message_event(42, "/channels"))
+    report = [s.text for s in since(mark) if "Forced-sub" in s.text]
+    check("/channels: which ones are really checked", report and "@chanA — ✅" in report[-1]
+          and "-100123 — ❌ NOT checked" in report[-1], report and report[-1])
+    check("the channel list on disk is left as written (a private channel's details kept)",
+          json.loads(main.FJ_PATH.read_text())["channels"] == channels)
+    await dispatch(message_event(42, "/addfsub -100555 t.me/chanB"))
+    check("/addfsub with a -100 id and a t.me link", [e[0] for e in main.forced_channel_entries()][-2:] == [-100555, "chanB"],
+          str(main.forced_channel_entries()))
+
 
 asyncio.run(main_test())
 print("\nALL OK" if ok else "\nFAILED")
