@@ -19,6 +19,10 @@ from telethon.errors import FloodWaitError, UserNotParticipantError, ChannelPriv
 from telethon.tl.functions.messages import SetTypingRequest
 from telethon.tl.types import SendMessageTypingAction, SendMessageUploadDocumentAction
 from telethon.tl.functions.channels import GetParticipantRequest
+try:                                     # button colours: Bot API 9.4 / Telethon ≥ 1.42
+    from telethon.tl.types import KeyboardButtonCallback, KeyboardButtonStyle
+except ImportError:
+    KeyboardButtonStyle = None
 import logging
 from utils.quota import actions_used_today, increment_if_under_limit
 from html import escape as _esc
@@ -54,6 +58,18 @@ ADMIN_IDS = get_env_or_config("ADMIN_IDS", "")
 START_TIME = datetime.now(timezone.utc)
 
 # FloodWait handler function
+def cbtn(text, data, style=None):
+    """An inline button, coloured where Telegram allows it: 'success' green, 'primary' blue, 'danger' red
+    (an older Telegram app or Telethon shows a plain button)."""
+    if style and KeyboardButtonStyle is not None:
+        try:
+            return KeyboardButtonCallback(text, data.encode() if isinstance(data, str) else data,
+                                          style=KeyboardButtonStyle(**{f"bg_{style}": True}))
+        except TypeError:
+            pass
+    return Button.inline(text, data)
+
+
 async def safe_send_file(client, chat_id, file, **kwargs):
     """Send file with automatic FloodWait handling"""
     max_retries = 3
@@ -384,11 +400,11 @@ def _file_question(stored: dict, has_thumbnail: bool, chat_id: int, msg_id: int)
     """The usual one-file question: text and buttons."""
     buttons = []
     if has_thumbnail:
-        buttons.append([Button.inline("🖼️ Add Thumbnail", f"thumb|{chat_id}|{msg_id}")])
+        buttons.append([cbtn("🖼️ Add Thumbnail", f"thumb|{chat_id}|{msg_id}", "success")])
     else:
         buttons.append([Button.inline("🖼️ Set Thumbnail First", "no_thumb")])
-    buttons.append([Button.inline("✏️ Rename Only", f"ren|{chat_id}|{msg_id}")])
-    buttons.append([Button.inline("❌ Cancel", f"cancel|{chat_id}|{msg_id}")])
+    buttons.append([cbtn("✏️ Rename Only", f"ren|{chat_id}|{msg_id}", "primary")])
+    buttons.append([cbtn("❌ Cancel", f"cancel|{chat_id}|{msg_id}", "danger")])
     info_text = f"""📁 <b>FILE INFORMATION</b>
 
 ◆ <b>Name:</b> <code>{stored['file_name']}</code>
@@ -436,11 +452,11 @@ async def _close_group(user_id: int, chat_id: int) -> None:
 🖼️ <b>Thumbnail on all</b>: your thumbnail goes on every file, names kept, sent back in order.
 ✏️ <b>One by one</b>: I ask you for each file, as usual."""
     if has_thumbnail:
-        first = [Button.inline(f"🖼️ Thumbnail on all {len(keys)}", f"bthumb|{batch_id}")]
+        first = [cbtn(f"🖼️ Thumbnail on all {len(keys)}", f"bthumb|{batch_id}", "success")]
     else:
         first = [Button.inline("🖼️ Set Thumbnail First (/setthumb)", "no_thumb")]
-    buttons = [first, [Button.inline("✏️ One by one", f"bone|{batch_id}")],
-               [Button.inline("❌ Cancel", f"bcancel|{batch_id}")]]
+    buttons = [first, [cbtn("✏️ One by one", f"bone|{batch_id}", "primary")],
+               [cbtn("❌ Cancel", f"bcancel|{batch_id}", "danger")]]
     await bot.send_message(chat_id, text, parse_mode='html', buttons=buttons, reply_to=keys[0][1])
 
 
@@ -608,7 +624,7 @@ async def send_force_join_message(event, missing_channels=None):
         label = ch if str(ch).startswith('@') else f"{ch}"
         url = f"https://t.me/{label.lstrip('@')}"
         buttons.append([Button.url(f"📢 Join {label}", url)])
-    buttons.append([Button.inline("✅ I have joined", "check_joined")])
+    buttons.append([cbtn("✅ I have joined", "check_joined", "success")])
 
     links = "\n".join(f"• {ch}" for ch in channels)
     message = (
@@ -703,6 +719,113 @@ async def ping_handler(event):
     """Test to see if bot responds"""
     await event.reply("🏓 Pong! Bot active.")
 
+async def all_user_ids() -> set:
+    """Everyone who ever used the bot: usage, settings and quota records."""
+    users = set()
+    for path in (usage_file, 'user_preferences.json'):
+        try:
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    users.update(int(uid) for uid in json.load(f).keys())
+        except Exception as e:
+            logging.warning(f"Could not read users from {path}: {e}")
+    try:
+        import aiosqlite
+        db_path = os.getenv("QUOTA_DB_PATH", "quota.db")
+        if os.path.exists(db_path):
+            async with aiosqlite.connect(db_path) as db:
+                cur = await db.execute("SELECT DISTINCT user_id FROM quotas")
+                users.update(row[0] for row in await cur.fetchall())
+                await cur.close()
+    except Exception as e:
+        logging.warning(f"Could not load users from quota DB: {e}")
+    return users
+
+
+async def send_to_all(user_ids, text: str) -> dict:
+    """One message to each user, paced; a flood wait is waited for (it used to count the user as failed)."""
+    counts = {"sent": 0, "blocked": 0, "failed": 0}
+    for uid in user_ids:
+        for attempt in range(2):
+            try:
+                await bot.send_message(uid, text, parse_mode='html', link_preview=False)
+                counts["sent"] += 1
+                break
+            except FloodWaitError as e:
+                if attempt or e.seconds > 300:
+                    counts["failed"] += 1
+                    break
+                await asyncio.sleep(e.seconds + 1)
+            except Exception as e:
+                if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
+                    counts["blocked"] += 1
+                else:
+                    counts["failed"] += 1
+                    logging.warning(f"Failed to send to {uid}: {e}")
+                break
+        await asyncio.sleep(0.05)
+    return counts
+
+
+# What's new: whatsnew.txt, newest version on top. A version not announced yet is sent once to every user at
+# start-up; a plain restart (crash, deploy without a new entry) tells users nothing, only the admins.
+WHATS_NEW_FILE = BASE_DIR / "whatsnew.txt"
+ANNOUNCED_FILE = BASE_DIR / "data" / "announced_version.txt"
+# The Telegraph guide (guide/telegraph_pages.py), linked from /help, /start and the update message
+GUIDE_EN = "https://telegra.ph/Rename-Bot--How-to-use-it-10-19"
+GUIDE_FR = "https://telegra.ph/Rename-Bot--Mode-demploi-10-19"
+
+
+def whats_new():
+    """(version, [changes]) of the newest entry of whatsnew.txt, or (None, [])."""
+    try:
+        lines = WHATS_NEW_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None, []
+    version, changes = None, []
+    for line in lines:
+        s = line.strip()
+        if s.startswith("==") and s.endswith("=="):
+            if version:
+                break
+            version = s.strip("= ").strip()
+        elif version and s.startswith("- "):
+            changes.append(s[2:].strip())
+    return version, changes
+
+
+def update_message(changes) -> str:
+    text = "🆕 <b>Rename Bot has been updated!</b>\n\n<b>What's new:</b>\n"
+    text += "\n".join(f"• {_esc(c)}" for c in changes)
+    text += f"\n\n📖 <a href=\"{GUIDE_EN}\">How to use the bot</a> · <a href=\"{GUIDE_FR}\">Mode d'emploi</a>"
+    return text
+
+
+async def announce_update():
+    """At start-up: a new version is announced to every user once; the admins hear of every restart."""
+    await asyncio.sleep(5)                       # let the bot settle first
+    version, changes = whats_new()
+    try:
+        announced = ANNOUNCED_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        announced = None
+    is_new = bool(version and changes) and version != announced
+    counts = None
+    if is_new:
+        ANNOUNCED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ANNOUNCED_FILE.write_text(version, encoding="utf-8")    # first: a crash midway never sends it twice
+        counts = await send_to_all(await all_user_ids(), update_message(changes))
+        logging.info(f"Update {version} announced: {counts}")
+    note = (f"🔄 <b>Rename bot restarted</b> (version {_esc(version or '?')}).\n"
+            + (f"🆕 Update announced to users: {counts['sent']} sent, {counts['blocked']} blocked, "
+               f"{counts['failed']} failed." if counts else "No new version: users were not told."))
+    for admin in ADMIN_SET:
+        try:
+            await bot.send_message(admin, note, parse_mode='html')
+        except Exception as e:
+            logging.warning(f"Restart note to admin {admin} failed: {e}")
+
+
 @bot.on(events.NewMessage(pattern=r"/broadcast(?:\s+.*)?"))
 async def broadcast_cmd(event):
     """Admin command to broadcast message to all users"""
@@ -727,63 +850,21 @@ async def broadcast_cmd(event):
 
     broadcast_msg = parts[1].strip()
 
-    # Get all unique user IDs from user_usage
     try:
-        all_users = set()
-
-        # Load from user_usage.json
-        if os.path.exists(usage_file):
-            with open(usage_file, 'r') as f:
-                data = json.load(f)
-                all_users.update(int(uid) for uid in data.keys())
-
-        # Load from user_preferences.json
-        if os.path.exists('user_preferences.json'):
-            with open('user_preferences.json', 'r') as f:
-                data = json.load(f)
-                all_users.update(int(uid) for uid in data.keys())
-
-        # Load from quota database
-        try:
-            import aiosqlite
-            db_path = os.getenv("QUOTA_DB_PATH", "quota.db")
-            if os.path.exists(db_path):
-                async with aiosqlite.connect(db_path) as db:
-                    cur = await db.execute("SELECT DISTINCT user_id FROM quotas")
-                    rows = await cur.fetchall()
-                    await cur.close()
-                    all_users.update(row[0] for row in rows)
-        except Exception as e:
-            logging.warning(f"Could not load users from quota DB: {e}")
-
+        all_users = await all_user_ids()
         if not all_users:
             await event.reply("❌ No users found in database.")
             return
 
         status_msg = await event.reply(f"📢 Broadcasting to {len(all_users)} users...")
-
-        success_count = 0
-        fail_count = 0
-        blocked_count = 0
-
-        for uid in all_users:
-            try:
-                await bot.send_message(uid, f"📢 <b>BROADCAST MESSAGE</b>\n\n{broadcast_msg}", parse_mode='html')
-                success_count += 1
-                await asyncio.sleep(0.05)  # Small delay to avoid flood
-            except Exception as e:
-                if "blocked" in str(e).lower() or "user is deactivated" in str(e).lower():
-                    blocked_count += 1
-                else:
-                    fail_count += 1
-                    logging.warning(f"Failed to send broadcast to {uid}: {e}")
+        counts = await send_to_all(all_users, f"📢 <b>BROADCAST MESSAGE</b>\n\n{broadcast_msg}")
 
         result_text = (
             f"✅ <b>Broadcast Complete!</b>\n\n"
             f"• Total users: {len(all_users)}\n"
-            f"• Sent successfully: {success_count}\n"
-            f"• Blocked/Deactivated: {blocked_count}\n"
-            f"• Failed: {fail_count}"
+            f"• Sent successfully: {counts['sent']}\n"
+            f"• Blocked/Deactivated: {counts['blocked']}\n"
+            f"• Failed: {counts['failed']}"
         )
 
         await safe_edit(status_msg, result_text, parse_mode='html')
@@ -1032,7 +1113,7 @@ async def auto_cleanup_task():
                 filepath = os.path.join(TEMP_DIR, filename)
                 if os.path.isfile(filepath):
                     file_age = current_time - os.path.getmtime(filepath)
-                    if file_age > 3600:  # More than 1 hour
+                    if file_age > 6 * 3600:  # 6 hours: never a big file still being uploaded
                         try:
                             os.remove(filepath)
                             logging.info(f"Orphaned file deleted: {filename}")
@@ -1357,6 +1438,7 @@ Send me any file and I'll help you rename it.
 
 <b>🎯 Commands:</b>
 /start - Show this message
+/help - How to use the bot (guide with pictures) 📖
 /settings - Configure bot settings ⚙️
 /usage - Check your usage limits
 /status - Show bot status 📊
@@ -1376,10 +1458,22 @@ Send me any file and I'll help you rename it.
     
     # Settings button
     keyboard = [
-        [Button.inline("⚙️ Settings", "show_settings")]
+        [cbtn("⚙️ Settings", "show_settings", "primary"), Button.url("📖 Guide", GUIDE_EN)]
     ]
-    
+
     await event.reply(welcome_text, parse_mode='html', buttons=keyboard)
+
+
+@bot.on(events.NewMessage(pattern=r'/help$'))
+async def help_handler(event):
+    """The guide, with pictures and a short video, in English and French."""
+    if not event.is_private:
+        return
+    await event.reply(
+        "📖 <b>How to use Rename Bot</b>\n\nEverything the bot does, step by step, with pictures and a short video.",
+        parse_mode='html',
+        buttons=[[Button.url("📖 Guide (English)", GUIDE_EN)], [Button.url("📖 Mode d'emploi (Français)", GUIDE_FR)]])
+
 
 @bot.on(events.NewMessage(pattern='/cancel'))
 async def cancel_handler(event):
@@ -1626,10 +1720,10 @@ async def show_settings_menu(event):
     text += "Choose an option:"
     
     keyboard = [
-        [Button.inline("➕ Add/Edit Custom Text", "add_custom_text")],
-        [Button.inline("📍 Change Position", "change_text_position")],
-        [Button.inline("🗑️ Remove Custom Text", "remove_custom_text")],
-        [Button.inline("🧹 Toggle Clean Tags", "toggle_clean_tags")],
+        [cbtn("➕ Add/Edit Custom Text", "add_custom_text", "success")],
+        [cbtn("📍 Change Position", "change_text_position", "primary")],
+        [cbtn("🗑️ Remove Custom Text", "remove_custom_text", "danger")],
+        [cbtn("🧹 Toggle Clean Tags", "toggle_clean_tags", "primary")],
         [Button.inline("❌ Close", "close_settings")]
     ]
     
@@ -2435,6 +2529,8 @@ if __name__ == '__main__':
         # Démarrer le client
         with bot:
             print("✅ Bot is running! Press Ctrl+C to stop.")
+            bot.loop.create_task(announce_update())      # a new version → every user told once
+            bot.loop.create_task(auto_cleanup_task())    # it was never started: leftovers piled up in temp_files
             bot.run_until_disconnected()
     except Exception as e:
         print(f"❌ Error: {str(e)}")

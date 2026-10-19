@@ -22,6 +22,7 @@ from types import SimpleNamespace
 SRC = Path(__file__).resolve().parent
 WORK = Path(tempfile.mkdtemp())
 shutil.copy(SRC / "main.py", WORK / "main.py")
+shutil.copy(SRC / "whatsnew.txt", WORK / "whatsnew.txt")
 shutil.copytree(SRC / "utils", WORK / "utils", ignore=shutil.ignore_patterns("__pycache__"))
 os.chdir(WORK)
 sys.path.insert(0, str(WORK))
@@ -309,6 +310,64 @@ async def main_test():
     await asyncio.sleep(0.8)
     check("a file sent in reply to the prompt: a new file (its question), not a rename",
           main.user_sessions.get(10, {}).get('action') == 'rename_stateless' and not since(mark, "file"))
+
+    # 8. the update message, the guide, the colours
+    real_sleep = asyncio.sleep
+    waits = []
+
+    async def quick_sleep(s, *a, **k):
+        waits.append(s)
+        await real_sleep(0)
+    main.asyncio.sleep = quick_sleep
+    mark = len(sent)
+    await main.announce_update()
+    news = [s for s in since(mark) if "has been updated" in s.text]
+    users = await main.all_user_ids()
+    check("a new version: every user told once, with what's new and the guide (EN + FR)",
+          len(news) == len(users) >= 3 and {s.chat for s in news} == users and "Rename Only" in news[0].text
+          and main.GUIDE_EN in news[0].text and main.GUIDE_FR in news[0].text, f"{len(news)} / {users}")
+    note = [s for s in since(mark) if s.chat == 42 and "restarted" in s.text]
+    check("… the admin told of the restart, with the count",
+          note and f"{len(users)} sent" in note[-1].text, note and note[-1].text)
+    mark = len(sent)
+    await main.announce_update()
+    check("… restarted again with no new version: users told nothing, the admin still told",
+          not [s for s in since(mark) if "has been updated" in s.text]
+          and any(s.chat == 42 and "No new version" in s.text for s in since(mark)))
+
+    from telethon.errors import FloodWaitError  # noqa: PLC0415
+    tries = {"n": 0}
+    real_send = main.bot.send_message
+
+    async def flood_once(chat, text="", **kw):
+        tries["n"] += 1
+        if tries["n"] == 1:
+            raise FloodWaitError(None, capture=7)
+        return await real_send(chat, text, **kw)
+    main.bot.send_message = flood_once
+    waits.clear()
+    counts = await main.send_to_all([7], "hello")
+    main.bot.send_message = real_send
+    main.asyncio.sleep = real_sleep
+    check("a flood wait while sending to everyone: waited for, then sent (it counted the user as failed)",
+          counts["sent"] == 1 and 8 in waits, f"{counts} {waits}")
+
+    mark = len(sent)
+    await dispatch(message_event(7, "/help"))
+    helps = [s for s in since(mark) if isinstance(getattr(s, "buttons", None), list)]
+    urls = [getattr(b, "url", "") for s in helps for row in s.buttons for b in row]
+    check("/help: the guide in English and French", main.GUIDE_EN in urls and main.GUIDE_FR in urls, str(urls))
+    mark = len(sent)
+    await dispatch(message_event(7, "/start"))
+    starts = [s for s in since(mark) if isinstance(getattr(s, "buttons", None), list)]
+    check("/start: a « 📖 Guide » button", starts and any(getattr(b, "url", "") == main.GUIDE_EN
+                                                      for row in starts[-1].buttons for b in row))
+    ev, buttons = await file_with_question(7, "colours.pdf")
+    question = [s for s in sent if isinstance(getattr(s, "buttons", None), list) and any(getattr(b, "text", "") == "🖼️ Add Thumbnail" for row in s.buttons for b in row)][-1]
+    styles = {b.text: b.style.to_dict() if getattr(b, "style", None) else None for row in question.buttons for b in row}
+    check("coloured buttons: Add Thumbnail green, Rename Only blue, Cancel red",
+          styles["🖼️ Add Thumbnail"]["bg_success"] and styles["✏️ Rename Only"]["bg_primary"]
+          and styles["❌ Cancel"]["bg_danger"], str(styles))
 
 
 asyncio.run(main_test())

@@ -1,0 +1,10 @@
+# What's new, newest version on top. At start-up, a version not announced yet is sent once to every user.
+# A version line is "== <version> ==", then one "- " line per change, in English, short.
+# To announce an update: add a new block at the top. A restart without a new block tells users nothing.
+
+== 2026-10-19 ==
+- Send several files at once: one tap puts your thumbnail on all of them.
+- « Rename Only » now really renames the file (before, only the caption changed).
+- A file now costs one action of your daily limit, whatever you do with it.
+- Any photo works as a thumbnail: it is resized the way Telegram wants it.
+- /settings shows its menu once, and « Clean Tags » off now keeps the @names.

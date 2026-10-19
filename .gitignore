@@ -30,3 +30,5 @@ Thumbs.db
 *.bak
 *.backup
 EOL
+# the last version announced to users (whatsnew.txt), per server
+data/announced_version.txt
